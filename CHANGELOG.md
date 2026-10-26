@@ -1,6 +1,29 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- New app icon and menu bar symbol ("Stacked Instances"), rendered from SVG sources in `design/icon` via `scripts/render-icons.swift`.
+- Popover header with service status, VM counts and a refresh button.
+- Empty state with a copyable `lume create` command, and an error banner with Try Again / Open Settings.
+- Row context menu: start headless or with display, open Screen Sharing, copy name or IP.
+- Screen Sharing source per VM (Automatic, Lume VNC, macOS Screen Sharing). Without Lume VNC (e.g. `--vnc disabled`) LumeBar falls back to the guest's own Screen Sharing for opening and, with a Keychain-stored login, for live previews.
+- `NSLocalNetworkUsageDescription` so macOS can prompt for Local Network access to guests.
+- Optional `LUMEBAR_SIGN_IDENTITY` for `scripts/package-app.sh` to sign with a stable identity.
+- Settings: grouped layout, connection status with Test Connection and Reset to Default, detected `lume` CLI location, app version.
+
+### Changed
+- VM rows show OS, CPU, memory and IP at a glance, with icon buttons for start, stop and Screen Sharing.
+- "Start headless" toggle is available directly in the popover footer.
+- Running VMs are listed first, then provisioning VMs, then the rest.
+- Compact thumbnail placeholder until the first VNC frame arrives; the "Double-click to open" hint only shows on hover.
+- README showcases the new design with screenshots.
+
+### Fixed
+- Start is no longer offered while a VM is provisioning; the row shows the provisioning step instead.
+- `lume` installed in `~/.local/bin` (the Lume installer's default) is now found when the app is launched from Finder.
+- Menu bar icon now loads from the compiled asset catalog instead of falling back to an SF Symbol.
+- Changing the service URL in Settings applies immediately and clears the previous connection status.
+- `scripts/package-app.sh` works with newer SwiftPM, where `.build/release` is a symlink.
 
 ## [1.0.0-beta3] - 2026-02-06
 ### Added

@@ -17,20 +17,27 @@ final class VNCThumbnailStore: ObservableObject {
         snapshottedVMs.removeAll()
     }
 
-    func start(vmName: String, vncUrl: String) {
+    /// Forget that a VM was already snapshotted so the next `start` reconnects (e.g. after changing its login).
+    func invalidate(vmName: String) {
+        snapshottedVMs.remove(vmName)
+        stop(vmName: vmName, clearImage: false)
+    }
+
+    func start(vmName: String, endpoint: ScreenSharingEndpoint) {
         let currentSession = snapshotSessionID
         if snapshottedVMs.contains(vmName) {
             return
         }
-        if let existing = connectionUrls[vmName], existing == vncUrl {
+        if let existing = connectionUrls[vmName], existing == endpoint.key {
             return
         }
         if connections[vmName] != nil {
             stop(vmName: vmName)
         }
-        guard let info = VNCConnectionInfo(vncUrl: vncUrl) else {
-            statuses[vmName] = "Invalid VNC URL"
+        guard endpoint.canSnapshot || endpoint.kind == .lumeVNC else {
+            // Guest Screen Sharing without a stored login: nothing to connect with.
             images.removeValue(forKey: vmName)
+            statuses.removeValue(forKey: vmName)
             return
         }
 
@@ -42,8 +49,8 @@ final class VNCThumbnailStore: ObservableObject {
                                      logErrorHandler: { _ in })
 
         let settings = VNCConnection.Settings(isDebugLoggingEnabled: false,
-                                              hostname: info.host,
-                                              port: UInt16(info.port),
+                                              hostname: endpoint.host,
+                                              port: UInt16(endpoint.port),
                                               isShared: true,
                                               isScalingEnabled: true,
                                               useDisplayLink: false,
@@ -56,7 +63,9 @@ final class VNCThumbnailStore: ObservableObject {
 
         let connection = VNCConnection(settings: settings, logger: logger)
         let delegate = ThumbnailConnection(vmName: vmName,
-                                           credential: info.credential,
+                                           credential: endpoint.credential,
+                                           // Don't poke a guest's live session; only Lume's own display needs waking.
+                                           wakeDisplay: endpoint.kind == .lumeVNC,
                                            connection: connection,
                                            stopAfterFirstFrame: true,
                                            onImage: { [weak self] image in
@@ -80,7 +89,7 @@ final class VNCThumbnailStore: ObservableObject {
                                            })
 
         connections[vmName] = delegate
-        connectionUrls[vmName] = vncUrl
+        connectionUrls[vmName] = endpoint.key
         statuses[vmName] = "Snapshotting…"
         delegate.connect()
     }
@@ -122,6 +131,7 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
     private let onStatus: (String) -> Void
     private let connection: VNCConnection
     private let stopAfterFirstFrame: Bool
+    private let wakeDisplay: Bool
     private let onComplete: @Sendable () -> Void
 
     private var lastUpdate = Date.distantPast
@@ -132,6 +142,7 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
 
     init(vmName: String,
          credential: VNCCredential?,
+         wakeDisplay: Bool,
          connection: VNCConnection,
          stopAfterFirstFrame: Bool,
          onImage: @escaping @Sendable (CGImage) -> Void,
@@ -142,6 +153,7 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
         self.onImage = onImage
         self.onStatus = onStatus
         self.connection = connection
+        self.wakeDisplay = wakeDisplay
         self.stopAfterFirstFrame = stopAfterFirstFrame
         self.onComplete = onComplete
         super.init()
@@ -225,7 +237,7 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
     }
 
     private func wakeDisplayIfNeeded(connection: VNCConnection) {
-        guard !didSendWakeInput else { return }
+        guard wakeDisplay, !didSendWakeInput else { return }
         didSendWakeInput = true
 
         let size = lastFramebufferSize ?? {
@@ -252,36 +264,5 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
         // Follow up with a harmless modifier tap as a fallback.
         connection.keyDown(.shift)
         connection.keyUp(.shift)
-    }
-}
-
-private struct VNCConnectionInfo {
-    let host: String
-    let port: Int
-    let credential: VNCCredential?
-
-    init?(vncUrl: String) {
-        guard let components = URLComponents(string: vncUrl),
-              components.scheme?.lowercased() == "vnc",
-              let host = components.host else {
-            return nil
-        }
-
-        self.host = host
-        self.port = components.port ?? 5900
-
-        let username = components.user
-        let password = components.password
-
-        if let password, !password.isEmpty {
-            if let username, !username.isEmpty {
-                credential = VNCUsernamePasswordCredential(username: username,
-                                                           password: password)
-            } else {
-                credential = VNCPasswordCredential(password: password)
-            }
-        } else {
-            credential = nil
-        }
     }
 }
