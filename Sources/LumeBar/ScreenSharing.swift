@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Network
 import RoyalVNCKit
 import Security
 
@@ -13,7 +14,7 @@ enum ScreenSharingPreference: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .auto: "Automatic (guest first)"
+        case .auto: "Automatic"
         case .lumeVNC: "Lume VNC"
         case .guest: "macOS Screen Sharing"
         }
@@ -26,39 +27,48 @@ struct ScreenSharingEndpoint {
 
     let kind: Kind
     let host: String
-    let port: Int
+    let port: UInt16
     /// URL handed to the system (`vnc://…`). Never contains guest credentials.
     let openURL: URL
     let credential: VNCCredential?
 
-    /// Stable identity used to decide whether a thumbnail needs reconnecting.
-    var key: String { "\(kind)-\(host):\(port)-\(credential != nil)" }
-
     /// Guest Screen Sharing needs a login before we can grab a thumbnail.
-    var canSnapshot: Bool { credential != nil }
+    var canSnapshot: Bool { kind == .lumeVNC || credential != nil }
 
     static func resolve(vm: LumeVM,
                         details: LumeVMDetails?,
                         preference: ScreenSharingPreference,
-                        guestLogin: GuestLogin?) -> ScreenSharingEndpoint? {
-        let lume = lumeEndpoint(vncUrl: details?.vncUrl ?? vm.vncUrl)
-        let guest = guestEndpoint(ip: details?.ipAddress ?? vm.ipAddress, login: guestLogin)
+                        guestLogin: GuestLogin?,
+                        service: URL? = nil) -> ScreenSharingEndpoint? {
+        var lume = lumeEndpoint(vncUrl: details?.vncUrl) ?? lumeEndpoint(vncUrl: vm.vncUrl)
+        if let service, let host = lume?.host, isLoopback(host), !isLoopback(service.host() ?? "") {
+            lume = nil
+        }
+        let guest = guestEndpoint(ip: guestAddress(for: vm, details: details), login: guestLogin)
 
         switch preference {
-        // Lume's built-in VNC server (Virtualization.framework `_VZVNCServer`) can hit an assertion and take the
-        // whole VM process down when a client connects. Prefer the guest's own Screen Sharing when reachable.
-        case .auto: return guest ?? lume
+        case .auto:
+            if vm.os?.lowercased() == "linux" { return lume }
+            // A guest IP does not mean Screen Sharing is enabled. A saved guest login
+            // indicates that the user intends to use the guest's own service.
+            if guestLogin != nil, let guest { return guest }
+            return lume ?? guest
         case .lumeVNC: return lume
         case .guest: return guest
         }
+    }
+
+    private static func isLoopback(_ host: String) -> Bool {
+        let name = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        return name == "localhost" || name == "::1" || (IPv4Address(name)?.rawValue.first == 127)
     }
 
     private static func lumeEndpoint(vncUrl: String?) -> ScreenSharingEndpoint? {
         guard let vncUrl, !vncUrl.isEmpty,
               let components = URLComponents(string: vncUrl),
               components.scheme?.lowercased() == "vnc",
-              let host = components.host, !host.isEmpty,
-              (1...65535).contains(components.port ?? 5900),
+              let host = components.url?.host(), !host.isEmpty,
+              let port = UInt16(exactly: components.port ?? 5900), port > 0,
               let url = URL(string: vncUrl) else { return nil }
 
         var credential: VNCCredential?
@@ -69,15 +79,19 @@ struct ScreenSharingEndpoint {
                 credential = VNCPasswordCredential(password: password)
             }
         }
-        return ScreenSharingEndpoint(kind: .lumeVNC, host: host, port: components.port ?? 5900,
+        return ScreenSharingEndpoint(kind: .lumeVNC, host: host, port: port,
                                      openURL: url, credential: credential)
     }
 
+    static func guestAddress(for vm: LumeVM, details: LumeVMDetails?) -> String? {
+        [details?.ipAddress, vm.ipAddress].compactMap { $0 }.first { !$0.isEmpty }
+    }
+
     private static func guestEndpoint(ip: String?, login: GuestLogin?) -> ScreenSharingEndpoint? {
-        guard let ip, !ip.isEmpty else { return nil }
+        guard let ip, IPv4Address(ip) != nil || IPv6Address(ip) != nil else { return nil }
         var components = URLComponents()
         components.scheme = "vnc"
-        components.host = ip
+        components.host = ip.contains(":") && !ip.hasPrefix("[") ? "[\(ip)]" : ip
         components.port = 5900
         // Pre-fill the user name only; the password stays in the Keychain.
         components.user = login?.username
@@ -104,22 +118,18 @@ final class ScreenSharingSettings: ObservableObject {
 
     private let service = "com.lume.LumeBar.screensharing"
 
-    func preference(for vmName: String) -> ScreenSharingPreference {
-        UserDefaults.standard.string(forKey: prefKey(vmName))
+    func preference(for vm: LumeVM, service: URL) -> ScreenSharingPreference {
+        UserDefaults.standard.string(forKey: preferenceKey(for: vm, service: service))
             .flatMap(ScreenSharingPreference.init(rawValue:)) ?? .auto
     }
 
-    func setPreference(_ preference: ScreenSharingPreference, for vmName: String) {
-        if preference == .auto {
-            UserDefaults.standard.removeObject(forKey: prefKey(vmName))
-        } else {
-            UserDefaults.standard.set(preference.rawValue, forKey: prefKey(vmName))
-        }
+    func setPreference(_ preference: ScreenSharingPreference, for vm: LumeVM, service: URL) {
+        UserDefaults.standard.set(preference.rawValue, forKey: preferenceKey(for: vm, service: service))
         revision += 1
     }
 
-    func guestLogin(for vmName: String, scope: String) -> GuestLogin? {
-        var query = baseQuery(vmName, scope: scope)
+    func guestLogin(for vm: LumeVM, service: URL, address: String) -> GuestLogin? {
+        var query = baseQuery(vm, service: service, address: address)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: AnyObject?
@@ -128,30 +138,46 @@ final class ScreenSharingSettings: ObservableObject {
         return try? JSONDecoder().decode(GuestLogin.self, from: data)
     }
 
-    func setGuestLogin(_ login: GuestLogin?, for vmName: String, scope: String) {
-        SecItemDelete(baseQuery(vmName, scope: scope) as CFDictionary)
-        if let login, let data = try? JSONEncoder().encode(login) {
-            var item = baseQuery(vmName, scope: scope)
-            item[kSecValueData as String] = data
-            SecItemAdd(item as CFDictionary, nil)
+    private func setGuestLogin(_ login: GuestLogin?, for vm: LumeVM, service: URL, address: String) throws {
+        var item = baseQuery(vm, service: service, address: address)
+        let status: OSStatus
+        if let login {
+            let data = try JSONEncoder().encode(login)
+            let update = SecItemUpdate(item as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+            if update == errSecItemNotFound {
+                item[kSecValueData as String] = data
+                status = SecItemAdd(item as CFDictionary, nil)
+            } else {
+                status = update
+            }
+        } else {
+            let deletion = SecItemDelete(item as CFDictionary)
+            status = deletion == errSecItemNotFound ? errSecSuccess : deletion
         }
+
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
         revision += 1
     }
 
-    func endpoint(for vm: LumeVM, details: LumeVMDetails?, scope: String) -> ScreenSharingEndpoint? {
-        ScreenSharingEndpoint.resolve(vm: vm,
-                                      details: details,
-                                      preference: preference(for: vm.name),
-                                      guestLogin: guestLogin(for: vm.name, scope: scope))
+    func endpoint(for vm: LumeVM, details: LumeVMDetails?, service: URL, loadLogin: Bool = true) -> ScreenSharingEndpoint? {
+        let preference = preference(for: vm, service: service)
+        let login: GuestLogin?
+        if loadLogin, preference != .lumeVNC,
+           preference == .guest || vm.os?.lowercased() != "linux",
+           let address = ScreenSharingEndpoint.guestAddress(for: vm, details: details) {
+            login = guestLogin(for: vm, service: service, address: address)
+        } else {
+            login = nil
+        }
+        return ScreenSharingEndpoint.resolve(vm: vm, details: details, preference: preference, guestLogin: login, service: service)
     }
 
-    /// Asks for the guest's Screen Sharing login with a small modal prompt.
-    func promptForGuestLogin(vmName: String, scope: String) {
-        let existing = guestLogin(for: vmName, scope: scope)
+    func promptForGuestLogin(vm: LumeVM, service: URL, address: String) {
+        let existing = guestLogin(for: vm, service: service, address: address)
 
         let alert = NSAlert()
-        alert.messageText = "Screen Sharing login for \(vmName)"
-        alert.informativeText = "Used for the live thumbnail and pre-filled when opening macOS Screen Sharing. The password is stored in your Keychain."
+        alert.messageText = "Screen Sharing login for \(vm.name)"
+        alert.informativeText = "LumeBar saves this login in Keychain for previews of this VM at \(address)."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         if existing != nil { alert.addButton(withTitle: "Remove") }
@@ -169,23 +195,54 @@ final class ScreenSharingSettings: ObservableObject {
         alert.window.initialFirstResponder = password
 
         NSApp.activate(ignoringOtherApps: true)
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            let name = user.stringValue.trimmingCharacters(in: .whitespaces)
-            guard !name.isEmpty, !password.stringValue.isEmpty else { return }
-            setGuestLogin(GuestLogin(username: name, password: password.stringValue), for: vmName, scope: scope)
-        case .alertThirdButtonReturn:
-            setGuestLogin(nil, for: vmName, scope: scope)
-        default:
-            break
+        let response = alert.runModal()
+        do {
+            switch response {
+            case .alertFirstButtonReturn:
+                let name = user.stringValue.trimmingCharacters(in: .whitespaces)
+                guard !name.isEmpty, !password.stringValue.isEmpty else {
+                    let error = NSAlert()
+                    error.messageText = "Enter a user name and password"
+                    error.runModal()
+                    return
+                }
+                try setGuestLogin(GuestLogin(username: name, password: password.stringValue), for: vm, service: service, address: address)
+            case .alertThirdButtonReturn:
+                try setGuestLogin(nil, for: vm, service: service, address: address)
+            default:
+                break
+            }
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.runModal()
         }
     }
 
-    private func prefKey(_ vmName: String) -> String { "lume.screenSharing.\(vmName)" }
+    private func preferenceKey(for vm: LumeVM, service: URL) -> String {
+        "lume.screenSharing.v2." + Self.scope(for: vm, service: service)
+    }
 
-    private func baseQuery(_ vmName: String, scope: String) -> [String: Any] {
+    static func scope(for vm: LumeVM, service: URL, address: String? = nil) -> String {
+        // Length-prefix the fields so distinct service, storage, VM and address tuples stay distinct.
+        [service.absoluteString, vm.storage ?? "", vm.name, address == nil ? "" : vm.macAddress ?? "", address ?? ""]
+            .map { "\($0.utf8.count):\($0)" }.joined()
+    }
+
+    private func baseQuery(_ vm: LumeVM, service url: URL, address: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: service,
-         kSecAttrAccount as String: "\(scope.utf8.count):\(scope)\(vmName)"]
+         kSecAttrAccount as String: Self.scope(for: vm, service: url, address: address)]
+    }
+}
+
+private struct KeychainError: LocalizedError {
+    let status: OSStatus
+
+    var errorDescription: String? {
+        "Could not save the Screen Sharing login."
+    }
+
+    var failureReason: String? {
+        SecCopyErrorMessageString(status, nil) as String?
     }
 }

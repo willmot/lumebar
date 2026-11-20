@@ -63,9 +63,12 @@ if [[ ! -d "$app_path" ]]; then
 fi
 
 echo "[sign] signing ${app_path}"
-codesign --deep --force --options runtime --sign "$identity" "$app_path"
+for dylib in "$app_path"/Contents/MacOS/*.dylib; do
+  [[ -f "$dylib" ]] || continue
+  codesign --force --options runtime --timestamp --sign "$identity" "$dylib"
+done
+codesign --force --options runtime --timestamp --sign "$identity" "$app_path"
 codesign --verify --deep --strict --verbose=2 "$app_path"
-spctl --assess --type execute --verbose "$app_path"
 
 echo "[notarize] creating upload zip at ${zip_path}"
 mkdir -p "$(dirname "$zip_path")"
@@ -78,6 +81,7 @@ xcrun notarytool submit "$zip_path" --keychain-profile "$keychain_profile" --wai
 echo "[notarize] stapling ticket"
 xcrun stapler staple "$app_path"
 xcrun stapler validate "$app_path"
+spctl --assess --type execute --verbose "$app_path"
 
 echo "[notarize] rebuilding zip with stapled app"
 rm -f "$zip_path"

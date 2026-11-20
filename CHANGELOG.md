@@ -1,29 +1,26 @@
 # Changelog
 
 ## [Unreleased]
+
+## [1.0.0-beta4]
+
 ### Added
-- New app icon and menu bar symbol ("Stacked Instances"), rendered from SVG sources in `design/icon` via `scripts/render-icons.swift`.
-- Popover header with service status, VM counts and a refresh button.
-- Empty state with a copyable `lume create` command, and an error banner with Try Again / Open Settings.
-- Row context menu: start headless or with display, open Screen Sharing, copy name or IP.
-- Screen Sharing source per VM (Automatic, Lume VNC, macOS Screen Sharing). Without Lume VNC (e.g. `--vnc disabled`) LumeBar falls back to the guest's own Screen Sharing for opening and, with a Keychain-stored login, for live previews.
-- `NSLocalNetworkUsageDescription` so macOS can prompt for Local Network access to guests.
-- Optional `LUMEBAR_SIGN_IDENTITY` for `scripts/package-app.sh` to sign with a stable identity.
-- Settings: grouped layout, connection status with Test Connection and Reset to Default, detected `lume` CLI location, app version.
+- A refreshed app icon and menu with service status, VM counts, a scrollable VM list, and per-VM actions.
+- A start-mode picker in the menu and Settings, with headless starts without Lume VNC as the default.
+- Per-VM Screen Sharing sources and read-only inline previews from Lume VNC or an authenticated macOS guest.
 
 ### Changed
-- VM rows show OS, CPU, memory and IP at a glance, with icon buttons for start, stop and Screen Sharing.
-- "Start headless" toggle is available directly in the popover footer.
-- Running VMs are listed first, then provisioning VMs, then the rest.
-- Compact thumbnail placeholder until the first VNC frame arrives; the "Double-click to open" hint only shows on hover.
-- README showcases the new design with screenshots.
+- Start and stop use the selected Lume service and VM storage location. The local CLI can start the default service when needed.
+- Settings validates the service URL and applies it when you select **Save and Test**.
+- Screen Sharing logins are scoped to the service, VM identity, storage location, and guest address. Logins from older preview builds need to be re-entered.
+- Packaging verifies the app signature before archiving. CI builds the bundle and runs Swift regression tests.
 
 ### Fixed
-- Start is no longer offered while a VM is provisioning; the row shows the provisioning step instead.
-- `lume` installed in `~/.local/bin` (the Lume installer's default) is now found when the app is launched from Finder.
-- Menu bar icon now loads from the compiled asset catalog instead of falling back to an SF Symbol.
-- Changing the service URL in Settings applies immediately and clears the previous connection status.
-- `scripts/package-app.sh` works with newer SwiftPM, where `.build/release` is a symlink.
+- VM starts without Lume VNC are always headless and require Lume 0.6.0 or later.
+- A VM that's still provisioning cannot be started from the menu.
+- Automatic Screen Sharing uses a Lume VNC endpoint when advertised and no guest login is saved.
+- Previews wait for a visible frame during boot and report guest authentication failures.
+- Running VM rows keep the IP address and storage visible, and Settings shows connection errors on their own line.
 
 ## [1.0.0-beta3] - 2026-02-06
 ### Added

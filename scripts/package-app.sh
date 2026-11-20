@@ -57,15 +57,17 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 app_name="LumeBar"
-binary_path=".build/release/${app_name}"
 plist_path="Sources/LumeBar/Resources/Info.plist"
 app_path="${output_dir}/${app_name}.app"
 zip_path="${output_dir}/${app_name}.zip"
 
 if [[ "$skip_build" -eq 0 ]]; then
   echo "[package] building release binary"
-  swift build -c release
+  swift build -c release --force-resolved-versions
 fi
+
+bin_dir="$(swift build -c release --show-bin-path)"
+binary_path="${bin_dir}/${app_name}"
 
 if [[ ! -x "$binary_path" ]]; then
   echo "error: release binary not found at ${binary_path}"
@@ -78,11 +80,9 @@ if [[ ! -f "$plist_path" ]]; then
   exit 1
 fi
 
-resource_bundle_path="$(
-  find -L .build -type d -path '*/release/*_LumeBar.bundle' -print -quit
-)"
-if [[ -z "$resource_bundle_path" ]]; then
-  echo "error: SwiftPM resource bundle not found in .build/release."
+resource_bundle_path="${bin_dir}/LumeBar_LumeBar.bundle"
+if [[ ! -d "$resource_bundle_path" ]]; then
+  echo "error: SwiftPM resource bundle not found at ${resource_bundle_path}"
   exit 1
 fi
 
@@ -97,15 +97,15 @@ chmod +x "$app_path/Contents/MacOS/${app_name}"
 
 # Compile asset catalog to generate AppIcon metadata and icon files for the app bundle.
 actool_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/lumebar.actool.XXXXXX")"
+trap 'rm -rf "$actool_tmp_dir"' EXIT
 xcrun actool "Sources/LumeBar/Resources/Assets.xcassets" \
   --compile "$actool_tmp_dir" \
   --platform macosx \
-  --minimum-deployment-target 13.0 \
+  --minimum-deployment-target 26.0 \
   --app-icon AppIcon \
   --output-partial-info-plist "$actool_tmp_dir/partial.plist" >/dev/null
 cp "$actool_tmp_dir/AppIcon.icns" "$app_path/Contents/Resources/AppIcon.icns"
 cp "$actool_tmp_dir/Assets.car" "$app_path/Contents/Resources/Assets.car"
-rm -rf "$actool_tmp_dir"
 
 # Ensure app bundle points to icon metadata in both legacy and modern forms.
 plutil -replace CFBundleIconFile -string AppIcon "$app_path/Contents/Info.plist"
@@ -115,14 +115,14 @@ plutil -replace CFBundlePackageType -string APPL "$app_path/Contents/Info.plist"
 
 # Copy SwiftPM dynamic libraries used by the executable.
 # The binary is linked with @rpath lookups that resolve next to the executable.
-while IFS= read -r dylib_path; do
+sign_identity="${LUMEBAR_SIGN_IDENTITY:--}"
+for dylib_path in "$bin_dir"/*.dylib; do
+  [[ -f "$dylib_path" ]] || continue
   cp "$dylib_path" "$app_path/Contents/MacOS/"
-done < <(find -L .build -type f -path '*/release/*.dylib' -not -path '*.dSYM/*' -print)
-
-if [[ -n "${LUMEBAR_SIGN_IDENTITY:-}" ]]; then
-  echo "[package] signing with identity: ${LUMEBAR_SIGN_IDENTITY}"
-  codesign --force --deep --sign "$LUMEBAR_SIGN_IDENTITY" "$app_path"
-fi
+  codesign --force --sign "$sign_identity" "$app_path/Contents/MacOS/${dylib_path##*/}"
+done
+codesign --force --sign "$sign_identity" "$app_path"
+codesign --verify --deep --strict "$app_path"
 
 if [[ "$create_zip" -eq 1 ]]; then
   echo "[package] creating zip archive at ${zip_path}"

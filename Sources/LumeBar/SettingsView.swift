@@ -1,125 +1,129 @@
 import SwiftUI
 
+enum VMStartMode: String, CaseIterable, Identifiable {
+    case guestSharing
+    case headless
+    case display
+
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .guestSharing: "Headless without Lume VNC"
+        case .headless: "Headless with Lume VNC"
+        case .display: "With display"
+        }
+    }
+
+    static func selection(noDisplay: Binding<Bool>, vncDisabled: Binding<Bool>) -> Binding<Self> {
+        Binding(
+            get: { vncDisabled.wrappedValue ? .guestSharing : (noDisplay.wrappedValue ? .headless : .display) },
+            set: {
+                noDisplay.wrappedValue = $0 != .display
+                vncDisabled.wrappedValue = $0 == .guestSharing
+            }
+        )
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var client: LumeClient
     @Binding var baseURL: String
     @Binding var noDisplay: Bool
     @Binding var vncDisabled: Bool
 
-    static let defaultBaseURL = "http://localhost:7777"
+    @State private var draftURL = ""
+    private let lumeDocs = URL(string: "https://cua.ai/docs/lume")!
 
     var body: some View {
         Form {
             Section("Lume Service") {
-                TextField("Service URL", text: $baseURL)
+                TextField("Service URL", text: $draftURL)
                     .multilineTextAlignment(.trailing)
+                    .onSubmit(saveAndTest)
 
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 8, height: 8)
-                    Text(statusText)
+                HStack {
+                    Text(connectionStatus)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Test Connection") {
-                        client.updateBaseURL(baseURL)
-                        Task { await client.fetchVms() }
+                    Button("Reset to Default") {
+                        draftURL = LumeClient.defaultService
+                        saveAndTest()
                     }
-                    if baseURL != Self.defaultBaseURL {
-                        Button("Reset to Default") {
-                            baseURL = Self.defaultBaseURL
-                        }
-                    }
+                    .disabled(draftURL == LumeClient.defaultService && baseURL == LumeClient.defaultService)
+                    Button(draftURL == baseURL ? "Test Connection" : "Save and Test", action: saveAndTest)
+                        .disabled(LumeClient.serviceURL(draftURL) == nil || (draftURL == baseURL && client.isLoading))
+                }
+                if let connectionHint {
+                    Text(connectionHint)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
             Section("Virtual Machines") {
-                Toggle(isOn: $noDisplay) {
-                    Text("Start VMs headless")
-                    Text("No display window opens. Use Screen Sharing from the menu to see the VM. Without Lume VNC, enable Screen Sharing in the guest (System Settings › General › Sharing).")
+                Picker("Start VMs", selection: VMStartMode.selection(noDisplay: $noDisplay, vncDisabled: $vncDisabled)) {
+                    ForEach(VMStartMode.allCases) { mode in Text(mode.title).tag(mode) }
                 }
-            }
-
-Section {
-                Toggle(isOn: $vncDisabled) {
-                    Text("Start VMs without VNC (--vnc disabled)")
-                    Text("Recommended on macOS 27.0: the Lume VNC server can crash the VM at start. Also closes the VNC port on the network. Use guest Screen Sharing instead.")
-                }
-            }
-
-            Section("Lume CLI") {
-                LabeledContent("Location") {
-                    if let path = client.lumeExecutablePath {
-                        Label {
-                            Text(abbreviatedPath(path))
-                                .font(.system(.body, design: .monospaced))
-                                .textSelection(.enabled)
-                        } icon: {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        }
-                    } else {
-                        Label {
-                            Text("Not found")
-                        } icon: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.red)
-                        }
-                    }
-                }
-                if client.lumeExecutablePath == nil {
-                    Link("Install Lume", destination: URL(string: "https://cua.ai/docs/lume/guide/getting-started/quickstart")!)
+                if vncDisabled {
+                    Text("Enable Screen Sharing inside the guest to connect from LumeBar.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
             }
 
             Section {
+                LabeledContent("Local Lume CLI") {
+                    if let path = LumeClient.findLumeExecutableURL()?.path {
+                        Text((path as NSString).abbreviatingWithTildeInPath)
+                            .textSelection(.enabled)
+                    } else {
+                        Text("Not found").foregroundStyle(.secondary)
+                    }
+                }
+
                 HStack {
-                    Text("LumeBar \(appVersion)")
-                        .foregroundStyle(.secondary)
+                    Text("LumeBar \(appVersion)").foregroundStyle(.secondary)
                     Spacer()
-                    Link("Lume documentation", destination: URL(string: "https://cua.ai/docs/lume/guide/getting-started/quickstart")!)
+                    Link("Lume documentation", destination: lumeDocs)
                 }
                 .font(.footnote)
             }
         }
         .formStyle(.grouped)
         .frame(width: 480)
-        .onChange(of: baseURL) {
-            client.updateBaseURL(baseURL)
-        }
+        .onAppear { draftURL = baseURL }
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private var statusColor: Color {
+    private func saveAndTest() {
+        guard let url = LumeClient.serviceURL(draftURL) else { return }
+        draftURL = url.absoluteString
+        baseURL = draftURL
+        client.updateBaseURL(draftURL)
+        Task { await client.fetchVms(startLocalService: true) }
+    }
+
+    private var connectionStatus: String {
+        if LumeClient.serviceURL(draftURL) == nil { return "Invalid URL" }
+        if draftURL != baseURL { return "Unsaved changes" }
+        if client.isLoading { return "Connecting…" }
         switch client.serviceReachable {
-        case .some(true): .green
-        case .some(false): .red
-        case .none: .secondary
+        case true?: return "Connected"
+        case false?: return "Connection failed"
+        case nil: return "Ready to test"
         }
     }
 
-    private var statusText: String {
-        switch client.serviceReachable {
-        case .some(true):
-            let count = client.vms.count
-            return "Connected · \(count == 1 ? "1 VM" : "\(count) VMs")"
-        case .some(false):
-            return "Not reachable"
-        case .none:
-            return "Not checked yet"
-        }
+    private var connectionHint: String? {
+        if LumeClient.serviceURL(draftURL) == nil { return "Enter an HTTP or HTTPS URL." }
+        guard draftURL == baseURL, !client.isLoading, client.serviceReachable == false else { return nil }
+        return client.serviceError
     }
 
     private var appVersion: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "dev"
-        if let build = info?["CFBundleVersion"] as? String {
-            return "\(version) (\(build))"
-        }
-        return version
-    }
-
-    private func abbreviatedPath(_ path: String) -> String {
-        (path as NSString).abbreviatingWithTildeInPath
+        guard let version = info?["CFBundleShortVersionString"] as? String else { return "dev" }
+        guard let build = info?["CFBundleVersion"] as? String else { return version }
+        return "\(version) (\(build))"
     }
 }

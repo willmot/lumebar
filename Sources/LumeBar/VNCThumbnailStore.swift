@@ -1,171 +1,116 @@
 import AppKit
-import Foundation
 import RoyalVNCKit
 
 @MainActor
 final class VNCThumbnailStore: ObservableObject {
-    @Published private(set) var images: [String: CGImage] = [:]
-    @Published private(set) var statuses: [String: String] = [:]
+    @Published private(set) var images: [LumeVM.ID: CGImage] = [:]
+    @Published private(set) var errors: [LumeVM.ID: String] = [:]
 
-    private var connections: [String: ThumbnailConnection] = [:]
-    private var connectionUrls: [String: String] = [:]
-    private var snapshotSessionID = UUID()
-    private var snapshottedVMs: Set<String> = []
-
-    func beginSnapshotSession() {
-        snapshotSessionID = UUID()
-        snapshottedVMs.removeAll()
+    private struct Snapshot {
+        let token: UUID
+        let connection: ThumbnailConnection
+        let timeout: Task<Void, Never>
     }
 
-    /// Forget that a VM was already snapshotted so the next `start` reconnects (e.g. after changing its login).
-    func invalidate(vmName: String) {
-        snapshottedVMs.remove(vmName)
-        stop(vmName: vmName, clearImage: false)
+    private var snapshots: [LumeVM.ID: Snapshot] = [:]
+    private var attemptedVMs: Set<LumeVM.ID> = []
+
+    func start(vm: LumeVM.ID, endpoint: ScreenSharingEndpoint) {
+        guard endpoint.canSnapshot, attemptedVMs.insert(vm).inserted else { return }
+
+        let token = UUID()
+        let connection = ThumbnailConnection(endpoint: endpoint) { [weak self] result in
+            Task { @MainActor in
+                self?.finish(vm: vm, token: token, result: result)
+            }
+        }
+        let timeout = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(8)) } catch { return }
+            self?.finish(vm: vm, token: token, result: .failed("Preview timed out"))
+        }
+        snapshots[vm] = Snapshot(token: token, connection: connection, timeout: timeout)
+        connection.connect()
     }
 
-    func start(vmName: String, endpoint: ScreenSharingEndpoint) {
-        let currentSession = snapshotSessionID
-        if snapshottedVMs.contains(vmName) {
-            return
-        }
-        if let existing = connectionUrls[vmName], existing == endpoint.key {
-            return
-        }
-        if connections[vmName] != nil {
-            stop(vmName: vmName)
-        }
-        guard endpoint.canSnapshot || endpoint.kind == .lumeVNC else {
-            // Guest Screen Sharing without a stored login: nothing to connect with.
-            images.removeValue(forKey: vmName)
-            statuses.removeValue(forKey: vmName)
-            return
-        }
-
-        snapshottedVMs.insert(vmName)
-
-        let logger = VNCCustomLogger(logDebugHandler: { _ in },
-                                     logInfoHandler: { _ in },
-                                     logWarningHandler: { _ in },
-                                     logErrorHandler: { _ in })
-
-        let settings = VNCConnection.Settings(isDebugLoggingEnabled: false,
-                                              hostname: endpoint.host,
-                                              port: UInt16(endpoint.port),
-                                              isShared: true,
-                                              isScalingEnabled: true,
-                                              useDisplayLink: false,
-                                              // Allow the connection to send basic keyboard input (used for wake events).
-                                              // This does not require Accessibility permissions.
-                                              inputMode: .forwardKeyboardShortcutsIfNotInUseLocally,
-                                              isClipboardRedirectionEnabled: false,
-                                              colorDepth: .depth24Bit,
-                                              frameEncodings: .default)
-
-        let connection = VNCConnection(settings: settings, logger: logger)
-        let delegate = ThumbnailConnection(vmName: vmName,
-                                           credential: endpoint.credential,
-                                           // Don't poke a guest's live session; only Lume's own display needs waking.
-                                           wakeDisplay: endpoint.kind == .lumeVNC,
-                                           connection: connection,
-                                           stopAfterFirstFrame: true,
-                                           onImage: { [weak self] image in
-                                               Task { @MainActor in
-                                                   guard self?.snapshotSessionID == currentSession else { return }
-                                                   self?.images[vmName] = image
-                                               }
-                                           },
-                                           onStatus: { [weak self] status in
-                                               Task { @MainActor in
-                                                   guard self?.snapshotSessionID == currentSession else { return }
-                                                   self?.statuses[vmName] = status
-                                               }
-                                           },
-                                           onComplete: { [weak self] in
-                                               Task { @MainActor in
-                                                   guard let self else { return }
-                                                   // Only tear down if we're still in the same session.
-                                                   guard self.snapshotSessionID == currentSession else { return }
-                                                   self.connections.removeValue(forKey: vmName)
-                                                   self.connectionUrls.removeValue(forKey: vmName)
-                                               }
-                                           })
-
-        connections[vmName] = delegate
-        connectionUrls[vmName] = endpoint.key
-        statuses[vmName] = "Snapshotting…"
-        delegate.connect()
-    }
-
-    func stop(vmName: String) {
-        stop(vmName: vmName, clearImage: true)
-    }
-
-    func stop(vmName: String, clearImage: Bool) {
-        guard let delegate = connections.removeValue(forKey: vmName) else { return }
-        delegate.disconnect()
-        statuses.removeValue(forKey: vmName)
-        if clearImage {
-            images.removeValue(forKey: vmName)
-        }
-        connectionUrls.removeValue(forKey: vmName)
-    }
-
-    func stopAll(keepImages: Bool = true) {
-        snapshotSessionID = UUID()
-        snapshottedVMs.removeAll()
-        if !keepImages {
-            images.removeAll()
-            statuses.removeAll()
-        }
-        let vmNames = Array(connections.keys)
-        for vmName in vmNames {
-            stop(vmName: vmName, clearImage: !keepImages)
+    private func finish(vm: LumeVM.ID, token: UUID, result: ThumbnailConnection.Result) {
+        // Ignore late frames and disconnects from superseded connections.
+        guard snapshots[vm]?.token == token else { return }
+        disconnect(vm: vm)
+        switch result {
+        case .image(let image): images[vm] = image
+        case .failed(let message): errors[vm] = message
         }
     }
 
-    func image(for vmName: String) -> CGImage? {
-        images[vmName]
+    private func disconnect(vm: LumeVM.ID) {
+        guard let snapshot = snapshots.removeValue(forKey: vm) else { return }
+        snapshot.timeout.cancel()
+        snapshot.connection.disconnect()
     }
 
-    func status(for vmName: String) -> String? {
-        statuses[vmName]
+    nonisolated static func hasVisibleContent(_ image: CGImage) -> Bool {
+        let side = 8
+        guard let context = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
+                                      bytesPerRow: side, space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue),
+              let data = context.data else { return true }
+        context.interpolationQuality = .medium
+        context.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+        return UnsafeRawBufferPointer(start: data, count: side * side).contains { $0 > 0 }
+    }
+
+    func releaseForScreenSharing(vm: LumeVM.ID) {
+        disconnect(vm: vm)
+        if images[vm] == nil { errors[vm] = "Screen Sharing opened separately" }
+    }
+
+    func stop(vm: LumeVM.ID) {
+        disconnect(vm: vm)
+        images[vm] = nil
+        errors[vm] = nil
+        attemptedVMs.remove(vm)
+    }
+
+    func stopAll() {
+        for id in Array(snapshots.keys) { disconnect(vm: id) }
+        images = [:]
+        errors = [:]
+        attemptedVMs = []
     }
 }
 
 private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
-    private let vmName: String
+    enum Result: Sendable {
+        case image(CGImage)
+        case failed(String)
+    }
+
+    private let endpointKind: ScreenSharingEndpoint.Kind
     private let credential: VNCCredential?
-    private let onImage: @Sendable (CGImage) -> Void
-    private let onStatus: (String) -> Void
     private let connection: VNCConnection
-    private let stopAfterFirstFrame: Bool
-    private let wakeDisplay: Bool
-    private let onComplete: @Sendable () -> Void
+    private let complete: @Sendable (Result) -> Void
 
-    private var lastUpdate = Date.distantPast
-    private let minUpdateInterval: TimeInterval = 2.0
-    private var lastFramebufferSize: (width: UInt16, height: UInt16)?
-    private var didSendWakeInput = false
-    private var didCaptureFrame = false
-
-    init(vmName: String,
-         credential: VNCCredential?,
-         wakeDisplay: Bool,
-         connection: VNCConnection,
-         stopAfterFirstFrame: Bool,
-         onImage: @escaping @Sendable (CGImage) -> Void,
-         onStatus: @escaping (String) -> Void,
-         onComplete: @escaping @Sendable () -> Void) {
-        self.vmName = vmName
-        self.credential = credential
-        self.onImage = onImage
-        self.onStatus = onStatus
-        self.connection = connection
-        self.wakeDisplay = wakeDisplay
-        self.stopAfterFirstFrame = stopAfterFirstFrame
-        self.onComplete = onComplete
+    init(endpoint: ScreenSharingEndpoint, complete: @escaping @Sendable (Result) -> Void) {
+        let logger = VNCCustomLogger(logDebugHandler: { _ in },
+                                     logInfoHandler: { _ in },
+                                     logWarningHandler: { _ in },
+                                     logErrorHandler: { _ in })
+        let settings = VNCConnection.Settings(isDebugLoggingEnabled: false,
+                                              hostname: endpoint.host,
+                                              port: endpoint.port,
+                                              isShared: true,
+                                              isScalingEnabled: true,
+                                              useDisplayLink: false,
+                                              inputMode: .none,
+                                              isClipboardRedirectionEnabled: false,
+                                              colorDepth: .depth24Bit,
+                                              frameEncodings: .default)
+        connection = VNCConnection(settings: settings, logger: logger)
+        endpointKind = endpoint.kind
+        credential = endpoint.credential
+        self.complete = complete
         super.init()
-        self.connection.delegate = self
+        connection.delegate = self
     }
 
     func connect() {
@@ -173,28 +118,16 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
     }
 
     func disconnect() {
-        connection.disconnect()
         connection.delegate = nil
+        connection.disconnect()
     }
 
-    func connection(_ connection: VNCConnection,
-                    stateDidChange connectionState: VNCConnection.ConnectionState) {
-        switch connectionState.status {
-        case .connecting:
-            onStatus("Connecting")
-        case .connected:
-            onStatus("Live")
-            wakeDisplayIfNeeded(connection: connection)
-        case .disconnecting:
-            onStatus("Disconnecting")
-        case .disconnected:
-            if let error = connectionState.error as? VNCError,
-               error.shouldDisplayToUser {
-                let description = error.errorDescription ?? "Unknown error"
-                onStatus("Error: \(description)")
-            } else {
-                onStatus("Disconnected")
-            }
+    func connection(_ connection: VNCConnection, stateDidChange state: VNCConnection.ConnectionState) {
+        guard state.status == .disconnected else { return }
+        if endpointKind == .guest, let error = state.error as? VNCError, error.isAuthenticationError {
+            complete(.failed("Check Screen Sharing login and access"))
+        } else {
+            complete(.failed("Preview unavailable"))
         }
     }
 
@@ -204,73 +137,15 @@ private final class ThumbnailConnection: NSObject, VNCConnectionDelegate {
         completion(credential)
     }
 
-    func connection(_ connection: VNCConnection,
-                    didCreateFramebuffer framebuffer: VNCFramebuffer) {
-        onStatus("Live")
-        updateFramebufferSize(framebuffer)
-    }
+    func connection(_ connection: VNCConnection, didCreateFramebuffer framebuffer: VNCFramebuffer) {}
+    func connection(_ connection: VNCConnection, didResizeFramebuffer framebuffer: VNCFramebuffer) {}
+    func connection(_ connection: VNCConnection, didUpdateCursor cursor: VNCCursor) {}
 
-    func connection(_ connection: VNCConnection,
-                    didResizeFramebuffer framebuffer: VNCFramebuffer) {
-        onStatus("Live")
-        updateFramebufferSize(framebuffer)
-    }
-
-    func connection(_ connection: VNCConnection,
-                    didUpdateCursor cursor: VNCCursor) {
-        // No-op; thumbnails ignore cursor updates.
-    }
-
-    func connection(_ connection: VNCConnection,
-                    didUpdateFramebuffer framebuffer: VNCFramebuffer,
-                    x: UInt16, y: UInt16,
-                    width: UInt16, height: UInt16) {
-        let now = Date()
-        guard now.timeIntervalSince(lastUpdate) >= minUpdateInterval else { return }
-        lastUpdate = now
-
-        guard !didCaptureFrame else { return }
-        guard let cgImage = framebuffer.cgImage else { return }
-        onImage(cgImage)
-
-        if stopAfterFirstFrame {
-            didCaptureFrame = true
-            disconnect()
-            onComplete()
-        }
-    }
-
-    private func updateFramebufferSize(_ framebuffer: VNCFramebuffer) {
-        lastFramebufferSize = (width: framebuffer.size.width, height: framebuffer.size.height)
-    }
-
-    private func wakeDisplayIfNeeded(connection: VNCConnection) {
-        guard wakeDisplay, !didSendWakeInput else { return }
-        didSendWakeInput = true
-
-        let size = lastFramebufferSize ?? {
-            if let framebuffer = connection.framebuffer {
-                return (width: framebuffer.size.width, height: framebuffer.size.height)
-            }
-            return nil
-        }()
-
-        guard let size else { return }
-        let width = size.width
-        let height = size.height
-        guard width > 2, height > 2 else { return }
-
-        // Some guests show a black framebuffer until *any* input is sent (Screen Sharing behaves similarly).
-        // Try a small mouse move + a single click to wake the display.
-        let x = max(UInt16(2), min(width - 3, width / 2))
-        let y = max(UInt16(2), min(height - 3, height / 2))
-
-        connection.mouseMove(x: x, y: y)
-        connection.mouseButtonDown(.left, x: x, y: y)
-        connection.mouseButtonUp(.left, x: x, y: y)
-
-        // Follow up with a harmless modifier tap as a fallback.
-        connection.keyDown(.shift)
-        connection.keyUp(.shift)
+    func connection(_ connection: VNCConnection, didUpdateFramebuffer framebuffer: VNCFramebuffer,
+                    x: UInt16, y: UInt16, width: UInt16, height: UInt16) {
+        // The first frame can be black while the guest boots. Keep listening
+        // within the snapshot timeout without waking or interacting with it.
+        guard let image = framebuffer.cgImage, VNCThumbnailStore.hasVisibleContent(image) else { return }
+        complete(.image(image))
     }
 }

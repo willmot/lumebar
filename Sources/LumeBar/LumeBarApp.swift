@@ -3,14 +3,16 @@ import SwiftUI
 
 @main
 struct LumeBarApp: App {
-    @AppStorage("lume.baseURL") private var baseURL = "http://localhost:7777"
+    @AppStorage("lume.baseURL") private var baseURL = LumeClient.defaultService
     @AppStorage("lume.noDisplay") private var noDisplay = true
     // macOS 27.0 crashes `lume run` in the VNC server setup, so VNC stays off unless switched on.
     @AppStorage("lume.vncDisabled") private var vncDisabled = true
-    @StateObject private var client = LumeClient()
+    @StateObject private var client: LumeClient
     @StateObject private var thumbnails = VNCThumbnailStore()
 
     init() {
+        let service = UserDefaults.standard.string(forKey: "lume.baseURL") ?? LumeClient.defaultService
+        _client = StateObject(wrappedValue: LumeClient(service: service))
         // Run as a menu bar only app (no Dock icon).
         NSApplication.shared.setActivationPolicy(.accessory)
     }
@@ -37,7 +39,7 @@ struct LumeBarApp: App {
                 .frame(width: 440)
                 .onAppear {
                     client.updateBaseURL(baseURL)
-                    client.willOpenLumeVNC = { [thumbnails] name in thumbnails.stop(vmName: name) }
+                    client.willOpenLumeVNC = { [thumbnails] id in thumbnails.releaseForScreenSharing(vm: id) }
                 }
                 .onChange(of: baseURL) {
                     client.updateBaseURL(baseURL)

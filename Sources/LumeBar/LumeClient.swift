@@ -13,15 +13,24 @@ struct LumeVM: Codable, Identifiable {
     let ipAddress: String?
     let vncUrl: String?
     let provisioningOperation: String?
+    let locationName: String?
+    let macAddress: String?
 
-    var id: String { name }
+    var storage: String? { locationName }
+
+    struct ID: Hashable {
+        let name: String
+        let storage: String?
+    }
+
+    var id: ID { ID(name: name, storage: storage) }
 
     var isRunning: Bool {
         (status ?? state)?.lowercased() == "running"
     }
 
     var isProvisioning: Bool {
-        (status ?? state)?.lowercased() == "provisioning"
+        ["provisioning", "pulling"].contains((status ?? state)?.lowercased() ?? "")
     }
 
     var sortRank: Int {
@@ -34,6 +43,7 @@ struct LumeVM: Codable, Identifiable {
         switch provisioningOperation?.lowercased() {
         case "ipsw_install": return "Installing macOS…"
         case "pull": return "Downloading image…"
+        case _ where (status ?? state)?.lowercased() == "pulling": return "Downloading image…"
         default: return "Provisioning…"
         }
     }
@@ -82,7 +92,7 @@ struct LumeVMDetails: Decodable {
         diskSize = container.decodeDiskSize(for: [.diskSize, .disk])
         os = decodeString([.os])
         display = decodeString([.display, .displaySize])
-        storage = decodeString([.storage])
+        storage = decodeString([.locationName, .storage])
         createdAt = decodeString([.createdAt, .created])
         vncUrl = decodeString([.vncUrl, .vnc])
     }
@@ -104,6 +114,7 @@ struct LumeVMDetails: Decodable {
         case display
         case displaySize
         case storage
+        case locationName
         case createdAt
         case created
         case vncUrl
@@ -118,431 +129,351 @@ struct DiskSize: Codable {
 
 @MainActor
 final class LumeClient: ObservableObject {
+    static let defaultService = "http://localhost:7777"
+
     @Published private(set) var vms: [LumeVM] = []
     @Published private(set) var isLoading = false
-    @Published private(set) var errorMessage: String?
-    @Published private(set) var details: [String: LumeVMDetails] = [:]
-    @Published private(set) var detailsLoading: Set<String> = []
-    @Published private(set) var detailsError: [String: String] = [:]
-    @Published private(set) var vmActionsInFlight: Set<String> = []
+    @Published private(set) var serviceError: String?
+    @Published private(set) var actionError: String?
     @Published private(set) var serviceReachable: Bool?
+    @Published private(set) var details: [LumeVM.ID: LumeVMDetails] = [:]
+    @Published private(set) var detailsError: [LumeVM.ID: String] = [:]
+    @Published private(set) var vmActionsInFlight: Set<LumeVM.ID> = []
+    @Published private(set) var serviceRevision = UUID()
 
-    /// Called before a Lume VNC connection is opened so other VNC clients (thumbnails) can release the server first.
-    var willOpenLumeVNC: ((String) -> Void)?
-    private var lastScreenSharingOpen: [String: Date] = [:]
-    private let screenSharingCooldown: TimeInterval = 3
-    private var baseURL = URL(string: "http://localhost:7777")!
-    private var didAttemptStartServer = false
+    var willOpenLumeVNC: ((LumeVM.ID) -> Void)?
+    private(set) var baseURL: URL?
+    private let session: URLSession
+    private var detailsRequests: [LumeVM.ID: UUID] = [:]
+    private var detailsUpdatedAt: [LumeVM.ID: ContinuousClock.Instant] = [:]
+    private var lastScreenSharingOpen: [LumeVM.ID: ContinuousClock.Instant] = [:]
     private var serverProcess: Process?
-    private var serverOutputPipe: Pipe?
-    private var serverErrorPipe: Pipe?
-    private var detailsUpdatedAt: [String: Date] = [:]
-    private var lastStates: [String: String] = [:]
-    private let detailsTTL: TimeInterval = 15
-    private let startVerificationTimeout: TimeInterval = 45
-    private let startVerificationPollInterval: TimeInterval = 1.5
-    private let detachedRunLogPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("lumebar-lume-run.log")
-    private let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return decoder
-    }()
+    private let clock = ContinuousClock()
+
+    init(service: String = LumeClient.defaultService, session: URLSession? = nil) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 120
+        self.session = session ?? URLSession(configuration: configuration, delegate: LumeRedirectPolicy(), delegateQueue: nil)
+        baseURL = Self.serviceURL(service)
+    }
+
+    static func serviceURL(_ value: String) -> URL? {
+        guard var components = URLComponents(string: value.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host?.lowercased(), !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              (1...65535).contains(components.port ?? 7777) else { return nil }
+        components.scheme = scheme
+        components.host = host
+        if components.port == (scheme == "https" ? 443 : 80) { components.port = nil }
+        while components.path.hasSuffix("/") { components.path.removeLast() }
+        return components.url
+    }
 
     var serviceAddress: String {
-        guard let host = baseURL.host else { return baseURL.absoluteString }
-        if let port = baseURL.port { return "\(host):\(port)" }
-        return host
+        guard let baseURL, let host = baseURL.host() else { return "Service URL" }
+        return baseURL.port.map { "\(host):\($0)" } ?? host
     }
 
-    var canControlVMs: Bool {
-        serviceReachable == true && baseURL.absoluteString == "http://localhost:7777"
-    }
-
-    var screenSharingScope: String { baseURL.absoluteString }
-
-    var lumeExecutablePath: String? {
-        findLumeExecutableURL()?.path
-    }
+    var isConfigured: Bool { baseURL != nil }
 
     func updateBaseURL(_ value: String) {
-        guard let url = URL(string: value), url != baseURL else { return }
+        let url = Self.serviceURL(value)
+        guard url != baseURL else { return }
         baseURL = url
+        serviceRevision = UUID()
         serviceReachable = nil
+        serviceError = nil
+        actionError = nil
+        isLoading = false
         vms = []
         details = [:]
         detailsError = [:]
+        detailsRequests = [:]
         detailsUpdatedAt = [:]
-        lastStates = [:]
+        vmActionsInFlight = []
+        lastScreenSharingOpen = [:]
     }
 
-    func fetchVms() async {
-        let requestedURL = baseURL
+    func fetchVms(startLocalService: Bool = false) async {
+        guard !isLoading else { return }
+        guard let url = baseURL else {
+            serviceError = "Enter a valid HTTP or HTTPS service URL in Settings."
+            serviceReachable = false
+            return
+        }
+        let revision = serviceRevision
         isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
+        defer {
+            if serviceRevision == revision { isLoading = false }
+        }
 
         do {
-            let decoded = try await withServerRetry { try await self.loadVMs() }
-            guard requestedURL == baseURL, !Task.isCancelled else { return }
-            // Running VMs first, then ones being provisioned, then the rest; by name within each group.
-            let sorted = decoded.sorted {
-                if $0.sortRank != $1.sortRank { return $0.sortRank < $1.sortRank }
-                return $0.name.lowercased() < $1.name.lowercased()
+            let loaded: [LumeVM]
+            do {
+                loaded = try await request(at: url)
+            } catch let error as URLError where error.code == .cannotConnectToHost && startLocalService && url.absoluteString == Self.defaultService {
+                try Task.checkCancellation()
+                guard serviceRevision == revision else { return }
+                startServerIfNeeded()
+                try await Task.sleep(for: .seconds(1))
+                loaded = try await request(at: url)
             }
-            vms = sorted
+            try Task.checkCancellation()
+            guard serviceRevision == revision else { return }
+            let oldVMs = Dictionary(vms.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let uniqueVMs = Dictionary(loaded.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for (id, vm) in oldVMs {
+                let replacement = uniqueVMs[id]
+                if replacement?.stateDescription != vm.stateDescription
+                    || replacement?.macAddress != vm.macAddress
+                    || replacement?.ipAddress != vm.ipAddress || replacement?.vncUrl != vm.vncUrl {
+                    details[id] = nil
+                    detailsUpdatedAt[id] = nil
+                    detailsRequests[id] = nil
+                    detailsError[id] = nil
+                }
+                if replacement == nil { lastScreenSharingOpen[id] = nil }
+            }
+            vms = uniqueVMs.values.sorted {
+                if $0.sortRank != $1.sortRank { return $0.sortRank < $1.sortRank }
+                let nameOrder = $0.name.localizedStandardCompare($1.name)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                if $0.name != $1.name { return $0.name < $1.name }
+                return ($0.storage ?? "") < ($1.storage ?? "")
+            }
             serviceReachable = true
-            pruneDetailsCache(with: sorted)
+            serviceError = nil
         } catch {
-            guard requestedURL == baseURL, !Task.isCancelled else { return }
+            guard serviceRevision == revision, !Task.isCancelled else { return }
             serviceReachable = false
-            errorMessage = errorMessage(from: error)
+            serviceError = message(for: error)
         }
     }
 
     func fetchDetails(for vm: LumeVM) async {
-        let name = vm.name
-        let requestedURL = baseURL
-        if let lastUpdate = detailsUpdatedAt[name],
-           Date().timeIntervalSince(lastUpdate) < detailsTTL {
-            return
+        let id = vm.id
+        guard let url = baseURL, vms.contains(where: { $0.id == id }), detailsRequests[id] == nil else { return }
+        if let updated = detailsUpdatedAt[id], updated.duration(to: clock.now) < .seconds(15) { return }
+
+        let requestID = UUID()
+        detailsRequests[id] = requestID
+        detailsError[id] = nil
+        defer {
+            if detailsRequests[id] == requestID { detailsRequests[id] = nil }
         }
-        if detailsLoading.contains(name) { return }
-        detailsLoading.insert(name)
-        detailsError[name] = nil
-        defer { detailsLoading.remove(name) }
 
         do {
-            let decoded = try await withServerRetry { try await self.loadDetails(for: name) }
-            guard requestedURL == baseURL, !Task.isCancelled else { return }
-            details[name] = decoded
-            detailsUpdatedAt[name] = Date()
+            let result: LumeVMDetails = try await request(at: url, vm: id)
+            try Task.checkCancellation()
+            guard detailsRequests[id] == requestID else { return }
+            details[id] = result
+            detailsUpdatedAt[id] = clock.now
         } catch {
-            guard requestedURL == baseURL, !Task.isCancelled else { return }
-            detailsError[name] = errorMessage(from: error)
+            guard detailsRequests[id] == requestID, !Task.isCancelled else { return }
+            detailsError[id] = message(for: error)
         }
     }
 
     func run(vm: LumeVM, noDisplay: Bool, vncDisabled: Bool) async {
-        guard canControlVMs, !vmActionsInFlight.contains(vm.name) else { return }
-        vmActionsInFlight.insert(vm.name)
-        defer { vmActionsInFlight.remove(vm.name) }
-
-        do {
-            var arguments = ["run", vm.name]
-            if noDisplay || vncDisabled {
-                arguments.append("--no-display")
-            }
-            if vncDisabled {
-                arguments.append(contentsOf: ["--vnc", "disabled"])
-            }
-            try await runCLIInBackground(arguments: arguments)
-            let isRunning = try await waitForRunningState(vmName: vm.name, timeout: startVerificationTimeout)
-            guard isRunning else {
-                throw LumeError.cliStartVerificationFailed(detachedRunLogPath)
-            }
-            await fetchVms()
-        } catch {
-            errorMessage = errorMessage(from: error)
-        }
+        await performAction(vm, action: "run", body: [
+            "noDisplay": noDisplay || vncDisabled,
+            "vnc": vncDisabled ? "disabled" : "enabled"
+        ])
     }
 
     func stop(vm: LumeVM) async {
-        guard canControlVMs, !vmActionsInFlight.contains(vm.name) else { return }
-        vmActionsInFlight.insert(vm.name)
-        defer { vmActionsInFlight.remove(vm.name) }
+        await performAction(vm, action: "stop", body: [:])
+    }
+
+    func dismissActionError() {
+        actionError = nil
+    }
+
+    private func performAction(_ vm: LumeVM, action: String, body: [String: any Sendable]) async {
+        guard let url = baseURL, serviceReachable == true,
+              let currentVM = vms.first(where: { $0.id == vm.id }),
+              action == "stop" ? currentVM.isRunning : (!currentVM.isRunning && !currentVM.isProvisioning),
+              vmActionsInFlight.insert(vm.id).inserted else { return }
+
+        let revision = serviceRevision
+        defer {
+            if revision == serviceRevision { vmActionsInFlight.remove(vm.id) }
+        }
+        actionError = nil
 
         do {
-            try await runCLI(arguments: ["stop", vm.name])
+            if body["vnc"] as? String == "disabled" {
+                try await verifyDisabledVNCSupport(at: url)
+                guard revision == serviceRevision, serviceReachable == true,
+                      vms.contains(where: { $0.id == vm.id && !$0.isRunning && !$0.isProvisioning }) else { return }
+            }
+            let request = try Self.makeRequest(at: url, vm: vm.id, action: action, body: body)
+            let (_, response) = try await session.data(for: request)
+            try Self.validate(response)
+            guard revision == serviceRevision else { return }
+            if action == "run" {
+                let deadline = clock.now.advanced(by: .seconds(45))
+                repeat {
+                    await fetchVms()
+                    guard revision == serviceRevision else { return }
+                    if vms.contains(where: { $0.id == vm.id && $0.isRunning }) { return }
+                    try await Task.sleep(for: .seconds(1))
+                } while clock.now < deadline
+                throw LumeError.runTimedOut
+            }
             await fetchVms()
         } catch {
-            errorMessage = errorMessage(from: error)
+            guard revision == serviceRevision, !Task.isCancelled else { return }
+            actionError = "\(vm.name) · \(message(for: error))"
         }
     }
 
-    func isActionInFlight(vmName: String) -> Bool {
-        vmActionsInFlight.contains(vmName)
+    private func verifyDisabledVNCSupport(at url: URL) async throws {
+        struct HostStatus: Decodable { let version: String }
+
+        do {
+            let request = URLRequest(url: url.appending(path: "lume/host/status"),
+                                     cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+            let (data, response) = try await session.data(for: request)
+            try Self.validate(response)
+            let host = try JSONDecoder().decode(HostStatus.self, from: data)
+            // Older servers silently ignore the unknown vnc field and start a listener.
+            let parts = host.version.split(separator: ".", omittingEmptySubsequences: false)
+            guard parts.count >= 3, let major = Int(parts[0]), let minor = Int(parts[1]),
+                  major > 0 || (major == 0 && minor >= 6) else { throw LumeError.vncPolicyUnavailable }
+        } catch {
+            try Task.checkCancellation()
+            throw LumeError.vncPolicyUnavailable
+        }
     }
 
     func openScreenSharing(vm: LumeVM) async {
-        guard serviceReachable == true else { return }
-        let requestedURL = baseURL
-        // Ignore repeated clicks: concurrent VNC handshakes can crash Lume's VNC server (and the VM with it).
-        let now = Date()
-        if let last = lastScreenSharingOpen[vm.name], now.timeIntervalSince(last) < screenSharingCooldown { return }
-        lastScreenSharingOpen[vm.name] = now
+        guard let url = baseURL, serviceReachable == true,
+              vms.contains(where: { $0.id == vm.id && $0.isRunning }) else { return }
+        let now = clock.now
+        if let last = lastScreenSharingOpen[vm.id], last.duration(to: now) < .seconds(3) { return }
+        lastScreenSharingOpen[vm.id] = now
+        let revision = serviceRevision
 
-        if details[vm.name]?.ipAddress == nil && details[vm.name]?.vncUrl == nil {
+        let sharing = ScreenSharingSettings.shared
+        if sharing.endpoint(for: vm, details: details[vm.id], service: url, loadLogin: false) == nil {
             await fetchDetails(for: vm)
         }
-
-        guard requestedURL == baseURL else { return }
-        let settings = ScreenSharingSettings.shared
-        if let endpoint = settings.endpoint(for: vm, details: details[vm.name], scope: screenSharingScope) {
-            if endpoint.kind == .lumeVNC {
-                // Drop our own thumbnail connection and let the server settle before a second client attaches.
-                willOpenLumeVNC?(vm.name)
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-            guard requestedURL == baseURL, !Task.isCancelled else { return }
-            NSWorkspace.shared.open(endpoint.openURL)
+        guard revision == serviceRevision, serviceReachable == true,
+              let current = vms.first(where: { $0.id == vm.id && $0.isRunning }) else { return }
+        guard let endpoint = sharing.endpoint(for: current, details: details[vm.id], service: url) else {
+            actionError = "No Screen Sharing address is available for \(vm.name)."
             return
         }
-
-        switch ScreenSharingSettings.shared.preference(for: vm.name) {
-        case .lumeVNC:
-            errorMessage = "\(vm.name) has no Lume VNC server (started with --vnc disabled?). Switch it to macOS Screen Sharing."
-        case .guest:
-            errorMessage = "No IP address yet for \(vm.name)."
-        case .auto:
-            errorMessage = "No VNC URL or IP available for \(vm.name)."
+        if endpoint.kind == .lumeVNC {
+            willOpenLumeVNC?(vm.id)
+            // Give Lume's VNC server time to release the thumbnail client.
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+        }
+        guard revision == serviceRevision, serviceReachable == true,
+              vms.contains(where: { $0.id == vm.id && $0.isRunning }) else { return }
+        if !NSWorkspace.shared.open(endpoint.openURL) {
+            actionError = "Could not open Screen Sharing for \(vm.name)."
         }
     }
 
-    private func loadVMs() async throws -> [LumeVM] {
-        let url = baseURL.appendingPathComponent("lume/vms")
-        let (data, response) = try await URLSession.shared.data(from: url)
-        try validate(response)
-        return try decoder.decode([LumeVM].self, from: data)
+    private func request<T: Decodable>(at url: URL, vm: LumeVM.ID? = nil) async throws -> T {
+        let request = try Self.makeRequest(at: url, vm: vm)
+        let (data, response) = try await session.data(for: request)
+        try Self.validate(response)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(T.self, from: data)
     }
 
-    private func loadDetails(for name: String) async throws -> LumeVMDetails {
-        let path = "lume/vms/\(escaped(name))"
-        let url = baseURL.appendingPathComponent(path)
-        let (data, response) = try await URLSession.shared.data(from: url)
-        try validate(response)
-        return try decoder.decode(LumeVMDetails.self, from: data)
-    }
-
-    private func withServerRetry<T>(_ operation: @escaping () async throws -> T) async throws -> T {
-        do {
-            return try await operation()
-        } catch {
-            if shouldAttemptStartServer(error: error) {
-                await startServerIfNeeded()
-                return try await operation()
+    static func makeRequest(at base: URL, vm: LumeVM.ID? = nil, action: String? = nil,
+                            body: [String: any Sendable] = [:]) throws -> URLRequest {
+        let list = base.appending(path: "lume/vms")
+        var url = list
+        if let vm {
+            // Encode the VM name as one path segment, including slashes and percent signs.
+            guard !vm.name.isEmpty, vm.name != ".", vm.name != "..",
+                  let name = vm.name.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/;%"))) else {
+                throw LumeError.invalidVMName
             }
-            throw error
+            guard let vmURL = URL(string: list.absoluteString + "/" + name) else { throw LumeError.invalidVMName }
+            url = vmURL
+            if let action { url.append(component: action) }
+            if action == nil, let storage = vm.storage { url.append(queryItems: [URLQueryItem(name: "storage", value: storage)]) }
         }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData,
+                                 timeoutInterval: action == "stop" ? 115 : 5)
+        if action != nil {
+            var payload = body
+            payload["storage"] = vm?.storage
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        }
+        return request
     }
 
-    private func escaped(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+    private static func validate(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else { throw LumeError.invalidResponse }
+        guard (200...299).contains(http.statusCode) else { throw LumeError.httpError(http.statusCode) }
     }
 
-    private func validate(_ response: URLResponse) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw LumeError.invalidResponse
-        }
-        guard (200...299).contains(http.statusCode) else {
-            throw LumeError.httpError(http.statusCode)
-        }
-    }
-
-    private func shouldAttemptStartServer(error: Error) -> Bool {
-        guard !didAttemptStartServer, baseURL.absoluteString == "http://localhost:7777" else { return false }
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .cannotConnectToHost,
-                 .networkConnectionLost,
-                 .notConnectedToInternet,
-                 .cannotFindHost,
-                 .timedOut:
-                return true
-            default:
-                return false
-            }
-        }
-        return false
-    }
-
-    private func startServerIfNeeded() async {
-        guard !didAttemptStartServer else { return }
-        didAttemptStartServer = true
-        if let serverProcess, serverProcess.isRunning { return }
-        guard let executableURL = findLumeExecutableURL() else { return }
-
+    private func startServerIfNeeded() {
+        guard serverProcess?.isRunning != true, let executable = Self.findLumeExecutableURL() else { return }
         let process = Process()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.executableURL = executableURL
+        process.executableURL = executable
         process.arguments = ["serve"]
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            serverProcess = process
         } catch {
-            return
-        }
-
-        serverProcess = process
-        serverOutputPipe = outputPipe
-        serverErrorPipe = errorPipe
-        consume(pipe: outputPipe)
-        consume(pipe: errorPipe)
-
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
-    }
-
-    private func errorMessage(from error: Error) -> String {
-        if let lumeError = error as? LumeError {
-            return lumeError.message
-        }
-        return "Lume API not reachable. Make sure the Lume service is running."
-    }
-
-    private func runCLI(arguments: [String]) async throws {
-        let executableURL = try requiredLumeExecutableURL()
-        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CLIResult, Error>) in
-            let process = Process()
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-
-            process.executableURL = executableURL
-            process.arguments = arguments
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
-
-            process.terminationHandler = { process in
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                let stdout = String(data: outputData, encoding: .utf8) ?? ""
-                let stderr = String(data: errorData, encoding: .utf8) ?? ""
-                continuation.resume(returning: CLIResult(status: process.terminationStatus,
-                                                         stdout: stdout,
-                                                         stderr: stderr))
-            }
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: LumeError.cliLaunchFailed)
-            }
-        }
-
-        guard result.status == 0 else {
-            throw LumeError.cliCommandFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
+            // The follow-up request reports whether the service became available.
         }
     }
 
-    private func runCLIInBackground(arguments: [String]) async throws {
-        let executablePath = try requiredLumeExecutableURL().path
-        let command = "nohup \(shellQuote(executablePath)) \(arguments.map(shellQuote).joined(separator: " ")) >\(shellQuote(detachedRunLogPath)) 2>&1 &"
-
-        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CLIResult, Error>) in
-            let process = Process()
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-lc", command]
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
-
-            process.terminationHandler = { process in
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                let stdout = String(data: outputData, encoding: .utf8) ?? ""
-                let stderr = String(data: errorData, encoding: .utf8) ?? ""
-                continuation.resume(returning: CLIResult(status: process.terminationStatus,
-                                                         stdout: stdout,
-                                                         stderr: stderr))
-            }
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: LumeError.cliLaunchFailed)
-            }
-        }
-
-        guard result.status == 0 else {
-            throw LumeError.cliCommandFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
-        }
+    static func findLumeExecutableURL() -> URL? {
+        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        let directories = paths + [NSHomeDirectory() + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+        return directories.lazy.filter { $0.hasPrefix("/") }
+            .map { URL(fileURLWithPath: $0).appending(component: "lume") }
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    private func waitForRunningState(vmName: String, timeout: TimeInterval) async throws -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-
-        while Date() < deadline {
-            do {
-                let current = try await withServerRetry { try await self.loadVMs() }
-                if current.contains(where: { $0.name == vmName && $0.isRunning }) {
-                    return true
-                }
-            } catch {
-                // Continue polling through transient API/server startup failures.
-            }
-
-            try? await Task.sleep(nanoseconds: UInt64(startVerificationPollInterval * 1_000_000_000))
-        }
-
-        return false
-    }
-
-    private func findLumeExecutableURL() -> URL? {
-        let env = ProcessInfo.processInfo.environment
-        let envPaths = (env["PATH"] ?? "")
-            .split(separator: ":")
-            .map(String.init)
-
-        // Apps launched from Finder get a minimal PATH, so also check the
-        // locations the Lume installer and Homebrew use.
-        let candidates = envPaths + [
-            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin"),
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin"
-        ]
-
-        let fileManager = FileManager.default
-        for dir in candidates {
-            let path = URL(fileURLWithPath: dir).appendingPathComponent("lume").path
-            if fileManager.isExecutableFile(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-
-        return nil
-    }
-
-    private func requiredLumeExecutableURL() throws -> URL {
-        guard let url = findLumeExecutableURL() else {
-            throw LumeError.cliNotInstalled
-        }
-        return url
-    }
-
-    private func shellQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
-    }
-
-    private func pruneDetailsCache(with vms: [LumeVM]) {
-        let names = Set(vms.map(\.name))
-        details = details.filter { names.contains($0.key) }
-        detailsError = detailsError.filter { names.contains($0.key) }
-        detailsLoading = Set(detailsLoading.filter { names.contains($0) })
-        detailsUpdatedAt = detailsUpdatedAt.filter { names.contains($0.key) }
-
-        for vm in vms {
-            let newState = vm.stateDescription
-            if let previous = lastStates[vm.name], previous != newState {
-                detailsUpdatedAt[vm.name] = nil
-                details[vm.name] = nil
-            }
-            lastStates[vm.name] = newState
+    private func message(for error: Error) -> String {
+        switch error {
+        case LumeError.invalidResponse: "The Lume service returned an unexpected response."
+        case LumeError.invalidVMName: "This VM has an invalid name."
+        case LumeError.httpError(409): "The Lume service reported a conflict. Check the host's VM limit and try again."
+        case LumeError.httpError(let status): "The Lume service returned HTTP \(status)."
+        case LumeError.vncPolicyUnavailable: "Could not verify support for VNC-disabled starts. Check the connection and use Lume 0.6.0 or later."
+        case LumeError.runTimedOut: "The VM did not reach running state within 45 seconds. Refresh to check its current status."
+        case is DecodingError: "The response could not be read. Check that the URL points to a compatible Lume service."
+        case is URLError: "Check the service URL and confirm that the Lume service is running."
+        default: "The Lume request failed."
         }
     }
+}
 
-    private func consume(pipe: Pipe) {
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-            }
-        }
+private final class LumeRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        // VM actions and connection settings belong to the configured service.
+        completionHandler(nil)
     }
+}
+
+private enum LumeError: Error {
+    case invalidResponse
+    case invalidVMName
+    case httpError(Int)
+    case runTimedOut
+    case vncPolicyUnavailable
 }
 
 private extension KeyedDecodingContainer where Key == LumeVMDetails.CodingKeys {
@@ -581,40 +512,4 @@ private extension KeyedDecodingContainer where Key == LumeVMDetails.CodingKeys {
         }
         return nil
     }
-}
-
-private enum LumeError: Error {
-    case invalidResponse
-    case httpError(Int)
-    case cliNotInstalled
-    case cliLaunchFailed
-    case cliCommandFailed(String)
-    case cliStartVerificationFailed(String)
-
-    var message: String {
-        switch self {
-        case .invalidResponse:
-            return "Unexpected response from Lume API."
-        case .httpError(let status):
-            return "Lume API returned HTTP \(status)."
-        case .cliNotInstalled:
-            return "Lume CLI not found. Install `lume` and ensure it is available in PATH (for example: /opt/homebrew/bin/lume)."
-        case .cliLaunchFailed:
-            return "Failed to launch `lume`. Make sure it is installed and available in PATH."
-        case .cliCommandFailed(let output):
-            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                return "Lume CLI command failed."
-            }
-            return trimmed
-        case .cliStartVerificationFailed(let logPath):
-            return "Lume run command started but VM did not reach running state in time. Check log: \(logPath)"
-        }
-    }
-}
-
-private struct CLIResult {
-    let status: Int32
-    let stdout: String
-    let stderr: String
 }

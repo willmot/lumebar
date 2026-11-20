@@ -5,33 +5,51 @@ struct ContentView: View {
     @ObservedObject var thumbnails: VNCThumbnailStore
     @Binding var noDisplay: Bool
     @Binding var vncDisabled: Bool
-
-    @State private var pollingTask: Task<Void, Never>?
+    @State private var listHeight: CGFloat = 60
 
     var body: some View {
         GlassEffectContainer {
             VStack(spacing: 12) {
                 header
 
-                if let error = client.errorMessage {
+                if let error = client.serviceError {
                     ErrorBanner(
-                        title: client.serviceReachable == false ? "Can't reach the Lume service" : "Something went wrong",
+                        title: "Lume service unavailable",
                         message: error,
-                        retry: { Task { await client.fetchVms() } }
+                        actionTitle: "Try Again",
+                        action: { Task { await client.fetchVms(startLocalService: true) } }
                     )
+                } else if let error = client.actionError {
+                    ErrorBanner(title: "VM action failed", message: error, actionTitle: "Dismiss",
+                                action: client.dismissActionError)
                 }
 
                 if client.vms.isEmpty {
-                    if !client.isLoading && client.serviceReachable == true {
+                    if client.serviceReachable == true {
                         EmptyStateView()
+                    } else if client.isLoading || (client.isConfigured && client.serviceReachable == nil) {
+                        ProgressView("Connecting to Lume…")
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
                     }
                 } else {
-                    VStack(spacing: 8) {
-                        ForEach(client.vms) { vm in
-                            VMRow(vm: vm, client: client, thumbnails: thumbnails, noDisplay: $noDisplay, vncDisabled: $vncDisabled)
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(client.vms) { vm in
+                                VMRow(vm: vm, client: client, thumbnails: thumbnails,
+                                      noDisplay: noDisplay, vncDisabled: vncDisabled)
+                            }
                         }
+                        .padding(2)
                     }
-                    .fixedSize(horizontal: false, vertical: true)
+                    .defaultScrollAnchor(.top)
+                    .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                        min(420, max(56, geometry.contentSize.height))
+                    } action: { _, height in
+                        listHeight = height
+                    }
+                    .frame(height: listHeight)
                 }
 
                 Divider()
@@ -41,18 +59,14 @@ struct ContentView: View {
             .padding(14)
             .glassEffect(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
-        .onAppear {
-            thumbnails.beginSnapshotSession()
-            startPolling()
+        .task(id: client.serviceRevision) {
+            await client.fetchVms(startLocalService: true)
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                await client.fetchVms()
+            }
         }
-        .onChange(of: client.screenSharingScope) {
-            thumbnails.stopAll(keepImages: false)
-        }
-        .onDisappear {
-            pollingTask?.cancel()
-            pollingTask = nil
-            thumbnails.stopAll(keepImages: true)
-        }
+        .onDisappear { thumbnails.stopAll() }
     }
 
     private var header: some View {
@@ -81,16 +95,17 @@ struct ContentView: View {
             Spacer()
 
             Button {
-                Task { await client.fetchVms() }
+                Task { await client.fetchVms(startLocalService: true) }
             } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 12, weight: .semibold))
-                    .rotationEffect(.degrees(client.isLoading ? 360 : 0))
-                    .animation(
-                        client.isLoading ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default,
-                        value: client.isLoading
-                    )
+                if client.isLoading {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                }
             }
+            .disabled(client.isLoading)
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
             .controlSize(.small)
@@ -112,7 +127,7 @@ struct ContentView: View {
         let address = client.serviceAddress
         switch client.serviceReachable {
         case .none:
-            return "\(address) · Connecting…"
+            return client.isConfigured ? "\(address) · Connecting…" : "Set a service URL"
         case .some(false):
             return "\(address) · Not connected"
         case .some(true):
@@ -126,17 +141,11 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Toggle("Start headless", isOn: $noDisplay)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .font(.caption)
-                .help("Start VMs without opening a display window (--display none)")
-
-            Toggle("VNC off", isOn: $vncDisabled)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .font(.caption)
-                .help("Start VMs with --vnc disabled. Avoids the macOS 27.0 VNC crash and closes the VNC port.")
+            Picker("Start VMs", selection: VMStartMode.selection(noDisplay: $noDisplay, vncDisabled: $vncDisabled)) {
+                ForEach(VMStartMode.allCases) { mode in Text(mode.title).tag(mode) }
+            }
+            .controlSize(.small)
+            .fixedSize()
 
             Spacer()
 
@@ -147,6 +156,7 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .help("Settings")
             .accessibilityLabel("Settings")
+            .keyboardShortcut(",")
 
             Button("Quit") {
                 NSApp.terminate(nil)
@@ -158,25 +168,13 @@ struct ContentView: View {
         .foregroundStyle(.secondary)
     }
 
-    private func startPolling() {
-        pollingTask?.cancel()
-        pollingTask = Task {
-            await client.fetchVms()
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                if Task.isCancelled { break }
-                if !client.isLoading {
-                    await client.fetchVms()
-                }
-            }
-        }
-    }
 }
 
 private struct ErrorBanner: View {
     let title: String
     let message: String
-    let retry: () -> Void
+    let actionTitle: String
+    let action: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -190,16 +188,16 @@ private struct ErrorBanner: View {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(3)
                     .textSelection(.enabled)
                 HStack(spacing: 8) {
-                    Button("Try Again", action: retry)
+                    Button(actionTitle, action: action)
                         .controlSize(.small)
-                    SettingsLink {
-                        Text("Open Settings…")
+                    if actionTitle == "Try Again" {
+                        SettingsLink { Text("Open Settings…") }
+                            .buttonStyle(.link)
+                            .controlSize(.small)
                     }
-                    .buttonStyle(.link)
-                    .controlSize(.small)
                 }
             }
 
@@ -228,7 +226,7 @@ private struct EmptyStateView: View {
             Text("No virtual machines")
                 .font(.system(size: 14, weight: .semibold))
 
-            Text("Create one in Terminal. It shows up here automatically.")
+            Text("Create a VM on the Lume host.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -249,7 +247,7 @@ private struct EmptyStateView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
-            .background(.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 20)
@@ -261,8 +259,9 @@ private struct VMRow: View {
     @ObservedObject var client: LumeClient
     @ObservedObject var thumbnails: VNCThumbnailStore
     @ObservedObject private var settings = ScreenSharingSettings.shared
-    @Binding var noDisplay: Bool
-    @Binding var vncDisabled: Bool
+    let noDisplay: Bool
+    let vncDisabled: Bool
+    @State private var canPreview = false
 
     private static let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -271,14 +270,25 @@ private struct VMRow: View {
         return formatter
     }()
 
-    private var isBusy: Bool { client.isActionInFlight(vmName: vm.name) }
+    private var isBusy: Bool { client.vmActionsInFlight.contains(vm.id) }
+    private var canAct: Bool { client.serviceReachable == true && !isBusy }
+    private var service: URL? { client.baseURL }
+    private var details: LumeVMDetails? { client.details[vm.id] }
 
-    private var endpoint: ScreenSharingEndpoint? {
-        settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope)
+    private struct PreviewRequest: Equatable {
+        let active: Bool
+        let revision: UUID
+        let settingsRevision: Int
+        let address: String?
+        let vncURL: String?
+        let macAddress: String?
     }
 
-    private var thumbnailTaskID: String {
-        "\(vm.name)-\(vm.isRunning)-\(endpoint?.key ?? "none")-\(settings.revision)"
+    private var previewRequest: PreviewRequest {
+        PreviewRequest(active: vm.isRunning && client.serviceReachable == true,
+                       revision: client.serviceRevision, settingsRevision: settings.revision,
+                       address: ScreenSharingEndpoint.guestAddress(for: vm, details: details),
+                       vncURL: details?.vncUrl ?? vm.vncUrl, macAddress: vm.macAddress)
     }
 
     var body: some View {
@@ -293,12 +303,30 @@ private struct VMRow: View {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let addressLine {
+                        Text(addressLine)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
 
                 Spacer(minLength: 6)
 
                 actions
+
+                Menu {
+                    contextMenu
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Actions for \(vm.name)")
+                .accessibilityLabel("Actions for \(vm.name)")
             }
 
             if vm.isProvisioning {
@@ -309,27 +337,24 @@ private struct VMRow: View {
             }
 
             if vm.isRunning {
-                DetailsView(vm: vm, client: client, thumbnails: thumbnails)
+                DetailsView(vm: vm, client: client, thumbnails: thumbnails, canPreview: canPreview)
             }
         }
         .padding(10)
         .glassEffect(in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .contextMenu { contextMenu }
-        .task(id: "\(vm.name)-\(vm.isRunning)") {
-            if vm.isRunning {
+        .task(id: previewRequest) {
+            thumbnails.stop(vm: vm.id)
+            canPreview = false
+            guard previewRequest.active, let service else { return }
+            guard let endpoint = settings.endpoint(for: vm, details: details, service: service) else {
                 await client.fetchDetails(for: vm)
+                return
             }
+            canPreview = endpoint.canSnapshot
+            thumbnails.start(vm: vm.id, endpoint: endpoint)
         }
-        .task(id: thumbnailTaskID) {
-            if vm.isRunning, let endpoint {
-                thumbnails.start(vmName: vm.name, endpoint: endpoint)
-            } else {
-                thumbnails.stop(vmName: vm.name)
-            }
-        }
-        .onChange(of: settings.revision) {
-            thumbnails.invalidate(vmName: vm.name)
-        }
+        .onDisappear { thumbnails.stop(vm: vm.id) }
     }
 
     private var statusColor: Color {
@@ -356,13 +381,19 @@ private struct VMRow: View {
         if let cpu = vm.cpuCount { parts.append("\(cpu) CPU") }
         if let memory = vm.memorySize { parts.append(Self.byteFormatter.string(fromByteCount: memory)) }
 
-        let ip = client.details[vm.name]?.ipAddress ?? vm.ipAddress
-        if vm.isRunning, let ip, !ip.isEmpty {
-            parts.append(ip)
-        } else if !vm.isRunning && !vm.isProvisioning {
-            parts.append(vm.stateDescription)
-        }
+        if !vm.isProvisioning { parts.append(vm.stateDescription) }
+        if addressLine == nil, let storage = storageLabel { parts.append(storage) }
         return parts.joined(separator: " · ")
+    }
+
+    private var addressLine: String? {
+        guard vm.isRunning, let ip = details?.ipAddress ?? vm.ipAddress, !ip.isEmpty else { return nil }
+        return storageLabel.map { "\(ip) · \($0)" } ?? ip
+    }
+
+    private var storageLabel: String? {
+        guard let storage = vm.storage, !storage.isEmpty, storage != "default" else { return nil }
+        return storage
     }
 
     @ViewBuilder
@@ -390,7 +421,7 @@ private struct VMRow: View {
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
             .controlSize(.small)
-            .disabled(!client.canControlVMs)
+            .disabled(!canAct)
             .help("Stop \(vm.name)")
             .accessibilityLabel("Stop \(vm.name)")
         } else {
@@ -404,7 +435,7 @@ private struct VMRow: View {
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
             .controlSize(.small)
-            .disabled(!client.canControlVMs)
+            .disabled(!canAct)
             .help((noDisplay || vncDisabled) ? "Start \(vm.name) headless" : "Start \(vm.name)")
             .accessibilityLabel("Start \(vm.name)")
         }
@@ -412,33 +443,38 @@ private struct VMRow: View {
 
     @ViewBuilder
     private var contextMenu: some View {
-        if vm.isRunning {
+        if vm.isRunning, let service {
             Button("Open Screen Sharing") {
                 Task { await client.openScreenSharing(vm: vm) }
             }
+            .disabled(!canAct)
             Picker("Screen Sharing Source", selection: Binding(
-                get: { settings.preference(for: vm.name) },
-                set: { settings.setPreference($0, for: vm.name) }
+                get: { settings.preference(for: vm, service: service) },
+                set: { settings.setPreference($0, for: vm, service: service) }
             )) {
                 ForEach(ScreenSharingPreference.allCases) { Text($0.title).tag($0) }
             }
-            Button(settings.guestLogin(for: vm.name, scope: client.screenSharingScope) == nil ? "Set Screen Sharing Login…" : "Edit Screen Sharing Login…") {
-                settings.promptForGuestLogin(vmName: vm.name, scope: client.screenSharingScope)
+            if ScreenSharingEndpoint.resolve(vm: vm, details: details, preference: .guest, guestLogin: nil) != nil,
+               let address = ScreenSharingEndpoint.guestAddress(for: vm, details: details) {
+                Button("Screen Sharing Login…") {
+                    settings.promptForGuestLogin(vm: vm, service: service, address: address)
+                }
+                .disabled(!canAct)
             }
             Button("Stop") {
                 Task { await client.stop(vm: vm) }
             }
-            .disabled(!client.canControlVMs)
+            .disabled(!canAct)
         } else if !vm.isProvisioning {
             Button("Start") {
                 Task { await client.run(vm: vm, noDisplay: noDisplay, vncDisabled: vncDisabled) }
             }
-            .disabled(!client.canControlVMs)
+            .disabled(!canAct)
             if !vncDisabled {
                 Button(noDisplay ? "Start with Display" : "Start Headless") {
                     Task { await client.run(vm: vm, noDisplay: !noDisplay, vncDisabled: false) }
                 }
-                .disabled(!client.canControlVMs)
+                .disabled(!canAct)
             }
         }
 
@@ -447,7 +483,7 @@ private struct VMRow: View {
         Button("Copy Name") {
             copy(vm.name)
         }
-        if let ip = client.details[vm.name]?.ipAddress ?? vm.ipAddress, !ip.isEmpty {
+        if let ip = client.details[vm.id]?.ipAddress ?? vm.ipAddress, !ip.isEmpty {
             Button("Copy IP Address") {
                 copy(ip)
             }
@@ -464,9 +500,8 @@ private struct DetailsView: View {
     let vm: LumeVM
     @ObservedObject var client: LumeClient
     @ObservedObject var thumbnails: VNCThumbnailStore
-    @ObservedObject private var settings = ScreenSharingSettings.shared
+    let canPreview: Bool
     @State private var isStatsExpanded = false
-    @State private var isHoveringThumbnail = false
     private static let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useGB, .useMB]
@@ -475,115 +510,52 @@ private struct DetailsView: View {
     }()
 
     var body: some View {
-        let rows = rowsForDetails()
-
         VStack(alignment: .leading, spacing: 8) {
-            if hasScreenPreview {
-                thumbnailView
-            }
+            if canPreview { thumbnailView }
 
-            if let error = client.detailsError[vm.name] {
-                Text(error)
-                    .font(.footnote)
-                    .foregroundColor(.red)
-            }
-
-            if hasExtraDetails(rows) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                        isStatsExpanded.toggle()
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "chevron.right")
-                                .font(.caption2.weight(.bold))
-                                .rotationEffect(.degrees(isStatsExpanded ? 90 : 0))
-                                .animation(.snappy(duration: 0.18), value: isStatsExpanded)
-                            Text("Details")
-                                .font(.caption.weight(.semibold))
-                            Spacer(minLength: 0)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-
-                    if isStatsExpanded {
-                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-                            detailRows(rows)
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
+            DisclosureGroup("Details", isExpanded: $isStatsExpanded) {
+                if let error = client.detailsError[vm.id] {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                    detailRows(rowsForDetails())
+                }
+                .padding(.top, 5)
+            }
+            .font(.caption)
+            .task(id: isStatsExpanded) {
+                if isStatsExpanded { await client.fetchDetails(for: vm) }
             }
         }
-    }
-
-    /// Only reserve space for a preview when there is a screen to show or one is loading.
-    /// Without one, the Screen Sharing button in the VM row is the way to connect.
-    private var hasScreenPreview: Bool {
-        if thumbnails.image(for: vm.name) != nil { return true }
-        guard let endpoint = settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope) else { return false }
-        return !(endpoint.kind == .guest && endpoint.canSnapshot == false)
     }
 
     private var thumbnailView: some View {
-        let image = thumbnails.image(for: vm.name)
-        let thumbnailAspect: CGFloat = 4.0 / 3.0
-        let endpoint = settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope)
-        let isScreenSharingReady = endpoint != nil
-        let needsGuestLogin = endpoint?.kind == .guest && endpoint?.canSnapshot == false
-
-        return ZStack(alignment: .bottomTrailing) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(.black.opacity(0.25))
-
-                if let image {
-                    Image(decorative: image, scale: 1, orientation: .up)
-                        .resizable()
-                        .scaledToFit()
-                } else if needsGuestLogin {
-                    Label("Screen Sharing · double-click to open", systemImage: "rectangle.on.rectangle")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                } else if endpoint == nil {
-                    Text("No screen available")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                } else {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text(thumbnails.status(for: vm.name) ?? "Waiting for video…")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+        Group {
+            if let image = thumbnails.images[vm.id] {
+                Image(decorative: image, scale: 1, orientation: .up)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 145)
+                    .clipShape(.rect(cornerRadius: 8))
+                    .frame(maxWidth: .infinity)
+            } else {
+                Group {
+                    if let error = thumbnails.errors[vm.id] {
+                        Text(error).font(.caption)
+                    } else {
+                        ProgressView("Loading preview…").controlSize(.small).font(.caption)
                     }
                 }
-            }
-
-            if (image != nil || needsGuestLogin) && isScreenSharingReady && isHoveringThumbnail {
-                Text("Double-click to open")
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .foregroundStyle(.white)
-                    .padding(8)
+                .frame(maxWidth: .infinity)
+                .frame(height: 42)
+                .background(.quaternary, in: .rect(cornerRadius: 8))
             }
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: image == nil ? 64 : nil)
-        .aspectRatio(image == nil ? nil : thumbnailAspect, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.15)) { isHoveringThumbnail = hovering }
-        }
-        .onTapGesture(count: 2) {
-            guard isScreenSharingReady else { return }
-            Task { await client.openScreenSharing(vm: vm) }
-        }
-        .help(isScreenSharingReady ? "Double-click to open Screen Sharing" : "Waiting for connection details")
+        .onTapGesture(count: 2) { Task { await client.openScreenSharing(vm: vm) } }
+        .help("Double-click to open Screen Sharing")
     }
 
     @ViewBuilder
@@ -609,7 +581,7 @@ private struct DetailsView: View {
     }
 
     private func rowsForDetails() -> [(String, String?)] {
-        if let details = client.details[vm.name] {
+        if let details = client.details[vm.id] {
             return [
                 ("IP", details.ipAddress),
                 ("CPU", formatCount(details.cpuCount)),
@@ -628,12 +600,6 @@ private struct DetailsView: View {
             ("Disk", formatDisk(vm.diskSize)),
             ("OS", vm.os)
         ]
-    }
-
-    private func hasExtraDetails(_ rows: [(String, String?)]) -> Bool {
-        rows.contains { row in
-            sanitized(row.1) != nil && row.0 != "OS"
-        }
     }
 
     private func formatBytes(_ bytes: Int64?) -> String? {
@@ -660,10 +626,8 @@ private struct DetailsView: View {
 private struct ScreenSharingButton: View {
     let vm: LumeVM
     @ObservedObject var client: LumeClient
-    @ObservedObject private var settings = ScreenSharingSettings.shared
-
     var body: some View {
-        let isReady = settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope) != nil
+        let isReady = client.serviceReachable == true
 
         return Button {
             Task { await client.openScreenSharing(vm: vm) }
@@ -675,7 +639,7 @@ private struct ScreenSharingButton: View {
         .buttonBorderShape(.circle)
         .controlSize(.small)
         .disabled(!isReady)
-        .help(isReady ? "Open Screen Sharing" : "Waiting for connection details")
-        .accessibilityLabel("Open Screen Sharing")
+        .help(isReady ? "Open Screen Sharing for \(vm.name)" : "Lume service unavailable")
+        .accessibilityLabel("Open Screen Sharing for \(vm.name)")
     }
 }
