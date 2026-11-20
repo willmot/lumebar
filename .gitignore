@@ -22,3 +22,6 @@ DerivedData/
 # Local generated assets and scratch files
 output/
 tmp/
+
+# Packaged app output
+dist/

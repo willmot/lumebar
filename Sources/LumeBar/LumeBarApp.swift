@@ -5,6 +5,8 @@ import SwiftUI
 struct LumeBarApp: App {
     @AppStorage("lume.baseURL") private var baseURL = "http://localhost:7777"
     @AppStorage("lume.noDisplay") private var noDisplay = true
+    // macOS 27.0 crashes `lume run` in the VNC server setup, so VNC stays off unless switched on.
+    @AppStorage("lume.vncDisabled") private var vncDisabled = true
     @StateObject private var client = LumeClient()
     @StateObject private var thumbnails = VNCThumbnailStore()
 
@@ -14,11 +16,7 @@ struct LumeBarApp: App {
     }
 
     private var menuBarStatusImage: NSImage {
-        if let url = Bundle.module.url(
-            forResource: "menubar-2x",
-            withExtension: "png",
-            subdirectory: "Assets.xcassets/MenubarIcon.imageset"
-        ), let image = NSImage(contentsOf: url) {
+        if let image = Bundle.module.image(forResource: "MenubarIcon") {
             image.size = NSSize(width: 18, height: 18)
             image.isTemplate = true
             return image
@@ -35,9 +33,12 @@ struct LumeBarApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            ContentView(client: client, thumbnails: thumbnails, noDisplay: $noDisplay)
+            ContentView(client: client, thumbnails: thumbnails, noDisplay: $noDisplay, vncDisabled: $vncDisabled)
                 .frame(width: 440)
-                .onAppear { client.updateBaseURL(baseURL) }
+                .onAppear {
+                    client.updateBaseURL(baseURL)
+                    client.willOpenLumeVNC = { [thumbnails] name in thumbnails.stop(vmName: name) }
+                }
                 .onChange(of: baseURL) {
                     client.updateBaseURL(baseURL)
                 }
@@ -55,7 +56,7 @@ struct LumeBarApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView(baseURL: $baseURL, noDisplay: $noDisplay)
+            SettingsView(client: client, baseURL: $baseURL, noDisplay: $noDisplay, vncDisabled: $vncDisabled)
         }
     }
 }

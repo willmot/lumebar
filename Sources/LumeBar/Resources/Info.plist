@@ -18,6 +18,8 @@
     <string>1.0.0</string>
     <key>CFBundleVersion</key>
     <string>100</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>LumeBar connects to your virtual machines' Screen Sharing on the local network to show a live preview.</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
