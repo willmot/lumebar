@@ -154,6 +154,12 @@ final class LumeClient: ObservableObject {
         return host
     }
 
+    var canControlVMs: Bool {
+        serviceReachable == true && baseURL.absoluteString == "http://localhost:7777"
+    }
+
+    var screenSharingScope: String { baseURL.absoluteString }
+
     var lumeExecutablePath: String? {
         findLumeExecutableURL()?.path
     }
@@ -162,15 +168,22 @@ final class LumeClient: ObservableObject {
         guard let url = URL(string: value), url != baseURL else { return }
         baseURL = url
         serviceReachable = nil
+        vms = []
+        details = [:]
+        detailsError = [:]
+        detailsUpdatedAt = [:]
+        lastStates = [:]
     }
 
     func fetchVms() async {
+        let requestedURL = baseURL
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
 
         do {
             let decoded = try await withServerRetry { try await self.loadVMs() }
+            guard requestedURL == baseURL, !Task.isCancelled else { return }
             // Running VMs first, then ones being provisioned, then the rest; by name within each group.
             let sorted = decoded.sorted {
                 if $0.sortRank != $1.sortRank { return $0.sortRank < $1.sortRank }
@@ -180,6 +193,7 @@ final class LumeClient: ObservableObject {
             serviceReachable = true
             pruneDetailsCache(with: sorted)
         } catch {
+            guard requestedURL == baseURL, !Task.isCancelled else { return }
             serviceReachable = false
             errorMessage = errorMessage(from: error)
         }
@@ -187,6 +201,7 @@ final class LumeClient: ObservableObject {
 
     func fetchDetails(for vm: LumeVM) async {
         let name = vm.name
+        let requestedURL = baseURL
         if let lastUpdate = detailsUpdatedAt[name],
            Date().timeIntervalSince(lastUpdate) < detailsTTL {
             return
@@ -198,21 +213,23 @@ final class LumeClient: ObservableObject {
 
         do {
             let decoded = try await withServerRetry { try await self.loadDetails(for: name) }
+            guard requestedURL == baseURL, !Task.isCancelled else { return }
             details[name] = decoded
             detailsUpdatedAt[name] = Date()
         } catch {
+            guard requestedURL == baseURL, !Task.isCancelled else { return }
             detailsError[name] = errorMessage(from: error)
         }
     }
 
     func run(vm: LumeVM, noDisplay: Bool, vncDisabled: Bool) async {
-        guard !vmActionsInFlight.contains(vm.name) else { return }
+        guard canControlVMs, !vmActionsInFlight.contains(vm.name) else { return }
         vmActionsInFlight.insert(vm.name)
         defer { vmActionsInFlight.remove(vm.name) }
 
         do {
             var arguments = ["run", vm.name]
-            if noDisplay {
+            if noDisplay || vncDisabled {
                 arguments.append("--no-display")
             }
             if vncDisabled {
@@ -230,7 +247,7 @@ final class LumeClient: ObservableObject {
     }
 
     func stop(vm: LumeVM) async {
-        guard !vmActionsInFlight.contains(vm.name) else { return }
+        guard canControlVMs, !vmActionsInFlight.contains(vm.name) else { return }
         vmActionsInFlight.insert(vm.name)
         defer { vmActionsInFlight.remove(vm.name) }
 
@@ -247,6 +264,8 @@ final class LumeClient: ObservableObject {
     }
 
     func openScreenSharing(vm: LumeVM) async {
+        guard serviceReachable == true else { return }
+        let requestedURL = baseURL
         // Ignore repeated clicks: concurrent VNC handshakes can crash Lume's VNC server (and the VM with it).
         let now = Date()
         if let last = lastScreenSharingOpen[vm.name], now.timeIntervalSince(last) < screenSharingCooldown { return }
@@ -256,13 +275,15 @@ final class LumeClient: ObservableObject {
             await fetchDetails(for: vm)
         }
 
+        guard requestedURL == baseURL else { return }
         let settings = ScreenSharingSettings.shared
-        if let endpoint = settings.endpoint(for: vm, details: details[vm.name]) {
+        if let endpoint = settings.endpoint(for: vm, details: details[vm.name], scope: screenSharingScope) {
             if endpoint.kind == .lumeVNC {
                 // Drop our own thumbnail connection and let the server settle before a second client attaches.
                 willOpenLumeVNC?(vm.name)
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
+            guard requestedURL == baseURL, !Task.isCancelled else { return }
             NSWorkspace.shared.open(endpoint.openURL)
             return
         }
@@ -318,7 +339,7 @@ final class LumeClient: ObservableObject {
     }
 
     private func shouldAttemptStartServer(error: Error) -> Bool {
-        guard !didAttemptStartServer else { return false }
+        guard !didAttemptStartServer, baseURL.absoluteString == "http://localhost:7777" else { return false }
         if let urlError = error as? URLError {
             switch urlError.code {
             case .cannotConnectToHost,

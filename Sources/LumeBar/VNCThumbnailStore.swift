@@ -70,11 +70,13 @@ final class VNCThumbnailStore: ObservableObject {
                                            stopAfterFirstFrame: true,
                                            onImage: { [weak self] image in
                                                Task { @MainActor in
+                                                   guard self?.snapshotSessionID == currentSession else { return }
                                                    self?.images[vmName] = image
                                                }
                                            },
                                            onStatus: { [weak self] status in
                                                Task { @MainActor in
+                                                   guard self?.snapshotSessionID == currentSession else { return }
                                                    self?.statuses[vmName] = status
                                                }
                                            },
@@ -109,6 +111,12 @@ final class VNCThumbnailStore: ObservableObject {
     }
 
     func stopAll(keepImages: Bool = true) {
+        snapshotSessionID = UUID()
+        snapshottedVMs.removeAll()
+        if !keepImages {
+            images.removeAll()
+            statuses.removeAll()
+        }
         let vmNames = Array(connections.keys)
         for vmName in vmNames {
             stop(vmName: vmName, clearImage: !keepImages)

@@ -16,9 +16,9 @@ Release status: `1.0.0-beta`
 
 ## Features
 - **See everything at a glance:** every VM with its OS, CPU, memory and IP, running VMs on top, plus a live service status in the header
-- **Start and stop in one click** using the local `lume` CLI, headless or with a display
+- **Start and stop in one click** on the default local service using the local `lume` CLI. Other service URLs support listing and Screen Sharing.
 - **Live previews:** a VNC snapshot of each running VM when you open the menu; double-click it to open Screen Sharing
-- **Lume VNC or macOS Screen Sharing:** previews and "Open Screen Sharing" use Lume's built-in VNC when available, and otherwise the guest's own Screen Sharing (e.g. VMs started with `--vnc disabled`); choose per VM from the right-click menu
+- **Lume VNC or macOS Screen Sharing:** choose the source per VM from its right-click menu.
 - **Provisioning progress:** VMs that are still installing show what they're doing instead of a Start button
 - **Right-click a VM** to start it headless or with a display, open Screen Sharing, or copy its name or IP
 - **Details on demand:** disk, storage, display and creation date behind a single disclosure
@@ -81,11 +81,11 @@ swift scripts/render-icons.swift
 
 ## Screen Sharing sources
 Right-click a running VM and pick **Screen Sharing Source**:
-- **Automatic** (default): Lume VNC if the VM has a VNC URL, otherwise the guest's Screen Sharing at `<vm-ip>:5900`.
+- **Automatic** (default): the guest's Screen Sharing at `<vm-ip>:5900` when it has an address, with Lume VNC as the fallback when it has no address.
 - **Lume VNC**: only Lume's built-in VNC server.
 - **macOS Screen Sharing**: only the guest's own Screen Sharing. Enable it in the guest (System Settings › General › Sharing).
 
-For a live preview of a guest's Screen Sharing, use **Set Screen Sharing Login…** and enter a guest user and password. They are stored in your Keychain. Without a login, the card shows a placeholder and double-click still opens Screen Sharing.
+For a live preview of a guest's Screen Sharing, use **Set Screen Sharing Login…** and enter a guest user and password. The login is stored in Keychain for this VM name and service URL. Enter it again if you used a build that saved logins by VM name alone. Without a login, the card shows a placeholder and double-click still opens Screen Sharing.
 
 ## Troubleshooting
 - Connecting to a guest needs macOS **Local Network** permission. macOS asks the first time; if previews show `Network is down` (NWError 50), enable LumeBar in System Settings › Privacy & Security › Local Network. After updating to a build with a different signature, switch it off and on again. Builds signed with a stable Developer ID keep the permission.

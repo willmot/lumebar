@@ -57,7 +57,8 @@ struct ScreenSharingEndpoint {
         guard let vncUrl, !vncUrl.isEmpty,
               let components = URLComponents(string: vncUrl),
               components.scheme?.lowercased() == "vnc",
-              let host = components.host,
+              let host = components.host, !host.isEmpty,
+              (1...65535).contains(components.port ?? 5900),
               let url = URL(string: vncUrl) else { return nil }
 
         var credential: VNCCredential?
@@ -117,8 +118,8 @@ final class ScreenSharingSettings: ObservableObject {
         revision += 1
     }
 
-    func guestLogin(for vmName: String) -> GuestLogin? {
-        var query = baseQuery(vmName)
+    func guestLogin(for vmName: String, scope: String) -> GuestLogin? {
+        var query = baseQuery(vmName, scope: scope)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: AnyObject?
@@ -127,26 +128,26 @@ final class ScreenSharingSettings: ObservableObject {
         return try? JSONDecoder().decode(GuestLogin.self, from: data)
     }
 
-    func setGuestLogin(_ login: GuestLogin?, for vmName: String) {
-        SecItemDelete(baseQuery(vmName) as CFDictionary)
+    func setGuestLogin(_ login: GuestLogin?, for vmName: String, scope: String) {
+        SecItemDelete(baseQuery(vmName, scope: scope) as CFDictionary)
         if let login, let data = try? JSONEncoder().encode(login) {
-            var item = baseQuery(vmName)
+            var item = baseQuery(vmName, scope: scope)
             item[kSecValueData as String] = data
             SecItemAdd(item as CFDictionary, nil)
         }
         revision += 1
     }
 
-    func endpoint(for vm: LumeVM, details: LumeVMDetails?) -> ScreenSharingEndpoint? {
+    func endpoint(for vm: LumeVM, details: LumeVMDetails?, scope: String) -> ScreenSharingEndpoint? {
         ScreenSharingEndpoint.resolve(vm: vm,
                                       details: details,
                                       preference: preference(for: vm.name),
-                                      guestLogin: guestLogin(for: vm.name))
+                                      guestLogin: guestLogin(for: vm.name, scope: scope))
     }
 
     /// Asks for the guest's Screen Sharing login with a small modal prompt.
-    func promptForGuestLogin(vmName: String) {
-        let existing = guestLogin(for: vmName)
+    func promptForGuestLogin(vmName: String, scope: String) {
+        let existing = guestLogin(for: vmName, scope: scope)
 
         let alert = NSAlert()
         alert.messageText = "Screen Sharing login for \(vmName)"
@@ -172,9 +173,9 @@ final class ScreenSharingSettings: ObservableObject {
         case .alertFirstButtonReturn:
             let name = user.stringValue.trimmingCharacters(in: .whitespaces)
             guard !name.isEmpty, !password.stringValue.isEmpty else { return }
-            setGuestLogin(GuestLogin(username: name, password: password.stringValue), for: vmName)
+            setGuestLogin(GuestLogin(username: name, password: password.stringValue), for: vmName, scope: scope)
         case .alertThirdButtonReturn:
-            setGuestLogin(nil, for: vmName)
+            setGuestLogin(nil, for: vmName, scope: scope)
         default:
             break
         }
@@ -182,9 +183,9 @@ final class ScreenSharingSettings: ObservableObject {
 
     private func prefKey(_ vmName: String) -> String { "lume.screenSharing.\(vmName)" }
 
-    private func baseQuery(_ vmName: String) -> [String: Any] {
+    private func baseQuery(_ vmName: String, scope: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: service,
-         kSecAttrAccount as String: vmName]
+         kSecAttrAccount as String: "\(scope.utf8.count):\(scope)\(vmName)"]
     }
 }

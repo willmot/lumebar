@@ -45,6 +45,9 @@ struct ContentView: View {
             thumbnails.beginSnapshotSession()
             startPolling()
         }
+        .onChange(of: client.screenSharingScope) {
+            thumbnails.stopAll(keepImages: false)
+        }
         .onDisappear {
             pollingTask?.cancel()
             pollingTask = nil
@@ -271,7 +274,7 @@ private struct VMRow: View {
     private var isBusy: Bool { client.isActionInFlight(vmName: vm.name) }
 
     private var endpoint: ScreenSharingEndpoint? {
-        settings.endpoint(for: vm, details: client.details[vm.name])
+        settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope)
     }
 
     private var thumbnailTaskID: String {
@@ -387,6 +390,7 @@ private struct VMRow: View {
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
             .controlSize(.small)
+            .disabled(!client.canControlVMs)
             .help("Stop \(vm.name)")
             .accessibilityLabel("Stop \(vm.name)")
         } else {
@@ -400,7 +404,8 @@ private struct VMRow: View {
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
             .controlSize(.small)
-            .help(noDisplay ? "Start \(vm.name) headless" : "Start \(vm.name)")
+            .disabled(!client.canControlVMs)
+            .help((noDisplay || vncDisabled) ? "Start \(vm.name) headless" : "Start \(vm.name)")
             .accessibilityLabel("Start \(vm.name)")
         }
     }
@@ -417,18 +422,23 @@ private struct VMRow: View {
             )) {
                 ForEach(ScreenSharingPreference.allCases) { Text($0.title).tag($0) }
             }
-            Button(settings.guestLogin(for: vm.name) == nil ? "Set Screen Sharing Login…" : "Edit Screen Sharing Login…") {
-                settings.promptForGuestLogin(vmName: vm.name)
+            Button(settings.guestLogin(for: vm.name, scope: client.screenSharingScope) == nil ? "Set Screen Sharing Login…" : "Edit Screen Sharing Login…") {
+                settings.promptForGuestLogin(vmName: vm.name, scope: client.screenSharingScope)
             }
             Button("Stop") {
                 Task { await client.stop(vm: vm) }
             }
+            .disabled(!client.canControlVMs)
         } else if !vm.isProvisioning {
             Button("Start") {
                 Task { await client.run(vm: vm, noDisplay: noDisplay, vncDisabled: vncDisabled) }
             }
-            Button(noDisplay ? "Start with Display" : "Start Headless") {
-                Task { await client.run(vm: vm, noDisplay: !noDisplay, vncDisabled: vncDisabled) }
+            .disabled(!client.canControlVMs)
+            if !vncDisabled {
+                Button(noDisplay ? "Start with Display" : "Start Headless") {
+                    Task { await client.run(vm: vm, noDisplay: !noDisplay, vncDisabled: false) }
+                }
+                .disabled(!client.canControlVMs)
             }
         }
 
@@ -512,14 +522,14 @@ private struct DetailsView: View {
     /// Without one, the Screen Sharing button in the VM row is the way to connect.
     private var hasScreenPreview: Bool {
         if thumbnails.image(for: vm.name) != nil { return true }
-        guard let endpoint = settings.endpoint(for: vm, details: client.details[vm.name]) else { return false }
+        guard let endpoint = settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope) else { return false }
         return !(endpoint.kind == .guest && endpoint.canSnapshot == false)
     }
 
     private var thumbnailView: some View {
         let image = thumbnails.image(for: vm.name)
         let thumbnailAspect: CGFloat = 4.0 / 3.0
-        let endpoint = settings.endpoint(for: vm, details: client.details[vm.name])
+        let endpoint = settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope)
         let isScreenSharingReady = endpoint != nil
         let needsGuestLogin = endpoint?.kind == .guest && endpoint?.canSnapshot == false
 
@@ -653,7 +663,7 @@ private struct ScreenSharingButton: View {
     @ObservedObject private var settings = ScreenSharingSettings.shared
 
     var body: some View {
-        let isReady = settings.endpoint(for: vm, details: client.details[vm.name]) != nil
+        let isReady = settings.endpoint(for: vm, details: client.details[vm.name], scope: client.screenSharingScope) != nil
 
         return Button {
             Task { await client.openScreenSharing(vm: vm) }
